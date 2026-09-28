@@ -790,98 +790,44 @@ def print_results(
         )
 
 
-# ============================================================
-# MAIN
-# ============================================================
+def run_agentic_search(
+    collection,
+    model,
+    reranker,
+    query: str,
+    top_k: int = DEFAULT_TOP_K,
+    candidate_k: int = DEFAULT_CANDIDATE_K,
+    company: str | None = None,
+    year: int | None = None,
+    form: str | None = None,
+) -> tuple[list[dict], str | None, str | None]:
+    """
+    Implements the full agentic retrieval loop:
+    Query Expansion -> Search -> Relevance Check -> Refinement -> Synthesis -> Audit.
 
-def main():
-
-    parser = argparse.ArgumentParser(
-        description="Search SEC filing embeddings."
-    )
-
-    parser.add_argument(
-        "query",
-        type=str,
-        help="Search query",
-    )
-
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=DEFAULT_TOP_K,
-        help="Number of results to display",
-    )
-
-    parser.add_argument(
-        "--candidate-k",
-        type=int,
-        default=DEFAULT_CANDIDATE_K,
-        help="Number of vector candidates before reranking",
-    )
-
-    parser.add_argument(
-        "--company",
-        type=str,
-        default=None,
-        help="Filter by company",
-    )
-
-    parser.add_argument(
-        "--year",
-        type=int,
-        default=None,
-        help="Filter by year",
-    )
-
-    parser.add_argument(
-        "--form",
-        type=str,
-        default=None,
-        choices=[
-            "10-K",
-            "10-Q",
-        ],
-        help="Filter by SEC form",
-    )
-
-    args = parser.parse_args()
-
-    print("=" * 80)
-    print("SEC RAG AGENTIC SEARCH")
-    print("=" * 80)
-
-    model = load_model()
-    reranker = load_reranker()
-    collection = load_collection()
-
-    # --------------------------------------------------------
-    # Agentic Retrieval Loop
-    # --------------------------------------------------------
+    Returns:
+        (final_results, synthesized_answer, audit_report)
+    """
     max_attempts = 3
-    current_query = args.query
+    current_query = query
     final_results = []
 
     for attempt in range(1, max_attempts + 1):
-        print(f"\nRetrieval Attempt {attempt}/{max_attempts}...")
-
-        # 1. Query Expansion (on first attempt or if refining)
+        # 1. Query Expansion
         queries_to_run = expand_query(current_query)
 
         all_candidates = []
         for q in queries_to_run:
-            # Use a modified version of search that doesn't print params every time
-            # or just call search and accept the output.
             res = search(
                 collection=collection,
                 model=model,
                 reranker=reranker,
                 query=q,
-                top_k=args.top_k,
-                candidate_k=args.candidate_k,
-                company=args.company,
-                year=args.year,
-                form=args.form,
+                top_k=top_k,
+                candidate_k=candidate_k,
+                company=company,
+                year=year,
+                form=form,
             )
             all_candidates.extend(res)
 
@@ -902,47 +848,31 @@ def main():
                 unique_results[i]["rerank_score"] = score
             unique_results.sort(key=lambda x: x["rerank_score"], reverse=True)
 
-        final_results = unique_results[:args.top_k]
+        final_results = unique_results[:top_k]
 
         # 4. Relevance Check
         if os.environ.get("ANTHROPIC_API_KEY"):
-            is_relevant, feedback = verify_relevance(args.query, final_results)
+            is_relevant, feedback = verify_relevance(query, final_results)
             if is_relevant:
-                print("Agent: Found sufficient information.")
                 break
             else:
-                print(f"Agent: Context insufficient. Feedback: {feedback}")
-                current_query = refine_query(args.query, feedback)
-                print(f"Agent: Refining query to: {current_query}")
+                current_query = refine_query(query, feedback)
         else:
             break
 
-    # --------------------------------------------------------
     # Synthesis & Verification
-    # --------------------------------------------------------
     synthesized_answer = None
+    audit_report = None
     if os.environ.get("ANTHROPIC_API_KEY"):
         synthesized_answer = synthesize_answer(
-            query=args.query,
+            query=query,
             results=final_results,
         )
 
         if synthesized_answer:
-            print("\nVerifying citations...")
-            is_verified, audit_report = verify_citations(synthesized_answer, final_results)
+            is_verified, report = verify_citations(synthesized_answer, final_results)
             if not is_verified:
-                print("\n--- CITATION AUDIT WARNING ---")
-                print(audit_report)
-                print("-----------------------------\n")
-            else:
-                print("Citations verified successfully.")
+                audit_report = report
 
-    print_results(
-        query=args.query,
-        results=final_results,
-        synthesized_answer=synthesized_answer,
-    )
+    return final_results, synthesized_answer, audit_report
 
-
-if __name__ == "__main__":
-    main()
