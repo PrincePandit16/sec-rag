@@ -83,9 +83,38 @@ def extract_metadata(filepath: Path) -> dict:
     }
 
 
-# ============================================================
-# HTML → Text
-# ============================================================
+def table_to_markdown(table_tag) -> str:
+    """
+    Convert a BeautifulSoup <table> tag into a GitHub Flavored Markdown table.
+    """
+    rows = table_tag.find_all("tr")
+    if not rows:
+        return ""
+
+    markdown_rows = []
+    for row in rows:
+        cells = row.find_all(["td", "th"])
+        # Get text from each cell, cleaning up internal whitespace
+        cell_texts = [cell.get_text(strip=True).replace("\n", " ").replace("|", "\\|") for cell in cells]
+        if cell_texts:
+            markdown_rows.append(f"| {' | '.join(cell_texts)} |")
+
+    if not markdown_rows:
+        return ""
+
+    # Create the separator row based on the first row's cell count
+    first_row_cells = rows[0].find_all(["td", "th"])
+    separator = f"| {' | '.join(['---'] * len(first_row_cells))} |"
+
+    if len(markdown_rows) > 1:
+        # Insert separator after the header row
+        markdown_rows.insert(1, separator)
+    else:
+        # If only one row, still add a separator to make it a valid MD table
+        markdown_rows.append(separator)
+
+    return "\n" + "\n".join(markdown_rows) + "\n"
+
 
 def html_to_text(filepath: Path) -> str:
     """
@@ -152,6 +181,16 @@ def html_to_text(filepath: Path) -> str:
         element.decompose()
 
     # --------------------------------------------------------
+    # Convert Tables to Markdown
+    # --------------------------------------------------------
+
+    for table in soup.find_all("table"):
+        markdown_table = table_to_markdown(table)
+        # Replace table with its markdown representation in a way that get_text picks up
+        # We wrap it in a span or just replace the table with its text content
+        table.replace_with(f"\n{markdown_table}\n")
+
+    # --------------------------------------------------------
     # Extract visible text
     # --------------------------------------------------------
 
@@ -208,9 +247,40 @@ def process_document(filepath: Path) -> dict | None:
 
             return None
 
+        # --------------------------------------------------------
+        # Section Splitting (Item Detection)
+        # --------------------------------------------------------
+        # SEC filings use 'Item X' as primary section markers.
+        # We split the text into sections to maintain hierarchy.
+        item_pattern = re.compile(r"(Item\s+\d+[A-Z]?\.?\s+[^ \n\r]+)", re.IGNORECASE)
+        sections = []
+
+        # Find all matches for "Item X ..."
+        matches = list(item_pattern.finditer(text))
+
+        if matches:
+            for i in range(len(matches)):
+                start = matches[i].start()
+                end = matches[i+1].start() if i + 1 < len(matches) else len(text)
+
+                section_name = matches[i].group(1).strip()
+                section_text = text[start:end].strip()
+
+                sections.append({
+                    "section_name": section_name,
+                    "text": section_text
+                })
+        else:
+            # Fallback if no items found
+            sections.append({
+                "section_name": "General",
+                "text": text
+            })
+
         document = {
             **metadata,
-            "text": text,
+            "sections": sections,
+            "text": text, # Keep original for backward compatibility
             "character_count": len(text),
         }
 

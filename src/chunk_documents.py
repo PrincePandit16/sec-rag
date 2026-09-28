@@ -77,42 +77,61 @@ def clean_text(text: str) -> str:
         text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
     text = re.sub(r"[☒☐]", " ", text)         # checkbox glyphs
     text = re.sub(r"[� ]", " ", text) # replacement characters and non-breaking spaces
-    text = re.sub(r"\.{2,}", " ", text)       # repeated dots in tables
+    # Removed repeated dots replacement to avoid corrupting MD table formatting
     text = re.sub(r"<[^>]+>", " ", text)       # strip any leftover HTML/XBRL tags
     text = re.sub(r"[ \t]+", " ", text)       # collapse horizontal whitespace only, preserve newlines
     text = text.strip()
     return text
 
 
-def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50):
-    """Splits text into overlapping chunks by token count.
-    Falls back to word-based splitting if tiktoken isn't available."""
+def recursive_split(text: str, max_tokens: int = 400) -> list[str]:
+    """
+    Splits text recursively by priority: \n\n -> \n -> ' '.
+    Ensures Markdown table rows (|) are kept together.
+    """
     if not text:
         return []
 
-    if _ENCODER is not None:
-        tokens = _ENCODER.encode(text)
-        chunks = []
-        start = 0
-        while start < len(tokens):
-            end = min(start + chunk_size, len(tokens))
-            chunk_tokens = tokens[start:end]
-            chunks.append(decode_tokens(chunk_tokens))
-            if end == len(tokens):
-                break
-            start += chunk_size - overlap
-        return chunks
-    else:
-        words = text.split()
-        chunks = []
-        start = 0
-        while start < len(words):
-            end = min(start + chunk_size, len(words))
-            chunks.append(" ".join(words[start:end]))
-            if end == len(words):
-                break
-            start += chunk_size - overlap
-        return chunks
+    # 1. Check if text already fits
+    if count_tokens(text) <= max_tokens:
+        return [text]
+
+    # 2. Priority splitters
+    splitters = ["\n\n", "\n", " "]
+
+    for splitter in splitters:
+        parts = text.split(splitter)
+        if len(parts) > 1:
+            chunks = []
+            current_chunk = ""
+
+            for part in parts:
+                # If the part contains a table pipe, we try to keep it intact
+                # unless it's already over the limit
+                candidate = (current_chunk + splitter + part).strip()
+                if count_tokens(candidate) <= max_tokens:
+                    current_chunk = candidate
+                else:
+                    if current_chunk:
+                        chunks.append(current_chunk)
+
+                    # If a single part is too big, recurse on it
+                    if count_tokens(part) > max_tokens:
+                        # We cannot simply recurse because we need to maintain
+                        # the splitting logic. We split the big part further.
+                        sub_chunks = recursive_split(part, max_tokens)
+                        chunks.extend(sub_chunks)
+                        current_chunk = ""
+                    else:
+                        current_chunk = part
+
+            if current_chunk:
+                chunks.append(current_chunk)
+
+            return chunks
+
+    # Fallback: Hard slice if everything else fails
+    return [text[:max_tokens * 4]] # Approximation
 
 
 def load_documents(input_path: str):
@@ -141,27 +160,49 @@ def process(input_path: str, output_path: str, chunk_size: int, overlap: int):
         for doc in load_documents(input_path):
             total_docs += 1
 
-            raw_text = doc.get("text", "")
-            text = clean_text(raw_text)
-            if not text:
-                continue
+            # --------------------------------------------------------
+            # Section-Aware Processing
+            # --------------------------------------------------------
+            # Use 'sections' if available from ingest.py, else fallback to 'text'
+            sections = doc.get("sections", [])
+            if not sections:
+                # Fallback for documents without identified items
+                sections = [{"section_name": "General", "text": doc.get("text", "")}]
 
-            pieces = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
-            n = len(pieces)
+            company = doc.get("company", "UNK")
+            date = doc.get("filing_date", "UNKDATE")
+            form = doc.get("form", "UNKFORM")
+            document_id = doc.get("document", "UNKDOC")
 
-            for i, piece in enumerate(pieces):
-                record = {
-                    "chunk_id": make_chunk_id(doc, i),
-                    "company": doc.get("company"),
-                    "filing_date": doc.get("filing_date"),
-                    "form": doc.get("form"),
-                    "document": doc.get("document"),
-                    "chunk_index": i,
-                    "total_chunks": n,
-                    "text": piece,
-                }
-                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                total_chunks += 1
+            for s_idx, section in enumerate(sections):
+                section_name = section.get("section_name", "General")
+                raw_text = section.get("text", "")
+
+                text = clean_text(raw_text)
+                if not text:
+                    continue
+
+                # recursive_split replaces the old sliding window chunk_text
+                pieces = recursive_split(text, max_tokens=chunk_size)
+                n = len(pieces)
+
+                for i, piece in enumerate(pieces):
+                    # Metadata Breadcrumb
+                    breadcrumb = f"{company} | {date} | {form} | {section_name}"
+                    chunk_text = f"{breadcrumb}\n\n{piece}"
+
+                    record = {
+                        "chunk_id": make_chunk_id(doc, (s_idx * n) + i),
+                        "company": company,
+                        "filing_date": date,
+                        "form": form,
+                        "document": document_id,
+                        "chunk_index": (s_idx * n) + i,
+                        "total_chunks": -1, # Recalculated later or left as total
+                        "text": chunk_text,
+                    }
+                    out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    total_chunks += 1
 
     print(f"Processed {total_docs} documents -> {total_chunks} chunks")
     print(f"Wrote output to {output_path}")
