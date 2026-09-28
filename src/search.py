@@ -219,8 +219,133 @@ def extract_keywords(query: str) -> list[str]:
 
 
 # ============================================================
-# METADATA FILTER
+# AGENTIC WORKFLOW HELPERS
 # ============================================================
+
+def expand_query(query: str) -> list[str]:
+    """Generates 3-5 semantically different versions of the query to improve recall."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return [query]
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    prompt = (
+        "You are a search optimization expert for financial filings. "
+        "Rewrite the following user query into 3-5 semantically different versions "
+        "to ensure a comprehensive vector search. Focus on different terminology "
+        "(e.g., 'revenue' vs 'net sales', 'profit' vs 'net income') and different "
+        "perspectives that might be used in an SEC filing.\n\n"
+        f"Query: {query}\n\n"
+        "Provide only the rewritten queries, one per line, without numbering or bullets."
+    )
+
+    try:
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20240620",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        expanded = message.content[0].text.strip().split("\n")
+        # Filter out empty lines and return original + expanded
+        return [query] + [q.strip() for q in expanded if q.strip()]
+    except Exception as e:
+        print(f"Error expanding query: {e}")
+        return [query]
+
+def verify_relevance(query: str, results: list[dict]) -> tuple[bool, str]:
+    """Checks if retrieved results are sufficient to answer the query."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return True, "" # Assume relevant if no LLM
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    context_parts = [f"[{i}] {res['document']}" for i, res in enumerate(results, start=1)]
+    context_text = "\n\n".join(context_parts)
+
+    prompt = (
+        "You are a financial auditor. Given the user query and the retrieved excerpts, "
+        "determine if the excerpts contain enough specific, factual, or numeric "
+        "information to provide a complete answer. Respond with 'YES' or 'NO' "
+        "followed by a brief explanation of what is missing if 'NO'.\n\n"
+        f"Query: {query}\n\n"
+        f"Context:\n{context_text}\n\n"
+        "Response (YES/NO and explanation):"
+    )
+
+    try:
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20240620",
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        response = message.content[0].text.strip()
+        is_relevant = response.upper().startswith("YES")
+        return is_relevant, response
+    except Exception as e:
+        print(f"Error verifying relevance: {e}")
+        return True, ""
+
+def refine_query(original_query: str, feedback: str) -> str:
+    """Refines the query based on what was missing in previous retrieval."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return original_query
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    prompt = (
+        "The previous search for '{original_query}' failed to find sufficient information. "
+        "The gap was: {feedback}. Rewrite the query to specifically target the missing "
+        "information, using alternative financial terminology likely to appear in SEC filings."
+    ).format(original_query=original_query, feedback=feedback)
+
+    try:
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20240620",
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return message.content[0].text.strip()
+    except Exception as e:
+        print(f"Error refining query: {e}")
+        return original_query
+
+def verify_citations(answer: str, results: list[dict]) -> tuple[bool, str]:
+    """Audits citations in the answer against the provided source chunks."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return True, "No API key for audit"
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    context_parts = [f"[{i}] {res['document']}" for i, res in enumerate(results, start=1)]
+    context_text = "\n\n".join(context_parts)
+
+    prompt = (
+        "You are a strict citation auditor. Review the following answer and its "
+        "citations (e.g., [1]). For every citation, check if the corresponding "
+        "excerpt actually supports the specific claim made. List any hallucinations, "
+        "incorrect citations, or unsupported claims. If all are correct, respond 'VERIFIED'.\n\n"
+        f"Context:\n{context_text}\n\n"
+        f"Answer:\n{answer}\n\n"
+        "Audit Report:"
+    )
+
+    try:
+        message = client.messages.create(
+            model="claude-3-5-sonnet-20240620",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        report = message.content[0].text.strip()
+        is_verified = report.upper() == "VERIFIED"
+        return is_verified, report
+    except Exception as e:
+        print(f"Error verifying citations: {e}")
+        return True, "Audit failed"
+
 
 def build_where_filter(
     company: str | None,
@@ -542,10 +667,12 @@ def synthesize_answer(
 
     prompt = (
         "You are a professional financial analyst. Answer the user's query based "
-        "ONLY on the provided SEC filing excerpts. If the answer is not contained "
-        "in the excerpts, clearly state that you do not have enough information. "
-        "Be precise, include numeric values exactly as they appear, and cite the "
-        "context using [number].\n\n"
+        "ONLY on the provided SEC filing excerpts. \n\n"
+        "STRICT RULES:\n"
+        "1. Every single factual claim or number MUST be followed by a citation [number].\n"
+        "2. Do not use outside knowledge.\n"
+        "3. If the answer is not present in the excerpts, clearly state that you do not have enough information.\n"
+        "4. Citations must be accurate to the provided index.\n\n"
         f"Context:\n{context_text}\n\n"
         f"Query: {query}\n\n"
         "Answer:"
@@ -721,40 +848,98 @@ def main():
     args = parser.parse_args()
 
     print("=" * 80)
-    print("SEC RAG SEARCH")
+    print("SEC RAG AGENTIC SEARCH")
     print("=" * 80)
 
     model = load_model()
     reranker = load_reranker()
-
     collection = load_collection()
 
-    results = search(
-        collection=collection,
-        model=model,
-        reranker=reranker,
-        query=args.query,
-        top_k=args.top_k,
-        candidate_k=args.candidate_k,
-        company=args.company,
-        year=args.year,
-        form=args.form,
-    )
+    # --------------------------------------------------------
+    # Agentic Retrieval Loop
+    # --------------------------------------------------------
+    max_attempts = 3
+    current_query = args.query
+    final_results = []
 
-    # Synthesis step
+    for attempt in range(1, max_attempts + 1):
+        print(f"\nRetrieval Attempt {attempt}/{max_attempts}...")
+
+        # 1. Query Expansion (on first attempt or if refining)
+        queries_to_run = expand_query(current_query)
+
+        all_candidates = []
+        for q in queries_to_run:
+            # Use a modified version of search that doesn't print params every time
+            # or just call search and accept the output.
+            res = search(
+                collection=collection,
+                model=model,
+                reranker=reranker,
+                query=q,
+                top_k=args.top_k,
+                candidate_k=args.candidate_k,
+                company=args.company,
+                year=args.year,
+                form=args.form,
+            )
+            all_candidates.extend(res)
+
+        # 2. Deduplicate by chunk_id
+        seen_ids = set()
+        unique_results = []
+        for c in all_candidates:
+            cid = c["metadata"].get("chunk_id")
+            if cid not in seen_ids:
+                unique_results.append(c)
+                seen_ids.add(cid)
+
+        # 3. Re-rerank the combined set
+        if reranker is not None and unique_results:
+            pairs = [[current_query, c["document"]] for c in unique_results]
+            scores = reranker.predict(pairs)
+            for i, score in enumerate(scores):
+                unique_results[i]["rerank_score"] = score
+            unique_results.sort(key=lambda x: x["rerank_score"], reverse=True)
+
+        final_results = unique_results[:args.top_k]
+
+        # 4. Relevance Check
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            is_relevant, feedback = verify_relevance(args.query, final_results)
+            if is_relevant:
+                print("Agent: Found sufficient information.")
+                break
+            else:
+                print(f"Agent: Context insufficient. Feedback: {feedback}")
+                current_query = refine_query(args.query, feedback)
+                print(f"Agent: Refining query to: {current_query}")
+        else:
+            break
+
+    # --------------------------------------------------------
+    # Synthesis & Verification
+    # --------------------------------------------------------
     synthesized_answer = None
     if os.environ.get("ANTHROPIC_API_KEY"):
         synthesized_answer = synthesize_answer(
             query=args.query,
-            results=results,
+            results=final_results,
         )
-    elif os.environ.get("ANTHROPIC_API_KEY") is None:
-        # Optional: notify user that synthesis is disabled
-        pass
+
+        if synthesized_answer:
+            print("\nVerifying citations...")
+            is_verified, audit_report = verify_citations(synthesized_answer, final_results)
+            if not is_verified:
+                print("\n--- CITATION AUDIT WARNING ---")
+                print(audit_report)
+                print("-----------------------------\n")
+            else:
+                print("Citations verified successfully.")
 
     print_results(
         query=args.query,
-        results=results,
+        results=final_results,
         synthesized_answer=synthesized_answer,
     )
 
