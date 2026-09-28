@@ -7,7 +7,7 @@ from pathlib import Path
 
 import anthropic
 import chromadb
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # ============================================================
@@ -19,6 +19,7 @@ COLLECTION_NAME = "sec_filings"
 
 
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 DEFAULT_TOP_K = 10
 DEFAULT_CANDIDATE_K = 100
@@ -38,6 +39,20 @@ def load_model():
     )
 
     print(f"Embedding device: {model.device}")
+
+    return model
+
+
+def load_reranker():
+
+    print("Loading reranker model...")
+
+    model = CrossEncoder(
+        RERANKER_MODEL,
+        device="cpu",
+    )
+
+    print(f"Reranker device: {model.device}")
 
     return model
 
@@ -264,6 +279,7 @@ def build_where_filter(
 def search(
     collection,
     model,
+    reranker,
     query: str,
     top_k: int = DEFAULT_TOP_K,
     candidate_k: int = DEFAULT_CANDIDATE_K,
@@ -474,11 +490,32 @@ def search(
         )
 
     # --------------------------------------------------------
+    # Reranking
+    # --------------------------------------------------------
+
+    if reranker is not None:
+        print(f"Reranking {len(candidates)} candidates...")
+
+        # Create (query, document) pairs
+        pairs = [[query, c["document"]] for c in candidates]
+
+        # Predict relevance scores
+        rerank_scores = reranker.predict(pairs)
+
+        # Assign scores back to candidates
+        for i, score in enumerate(rerank_scores):
+            candidates[i]["rerank_score"] = score
+    else:
+        # Fallback: use existing score as rerank_score
+        for c in candidates:
+            c["rerank_score"] = c["score"]
+
+    # --------------------------------------------------------
     # Sort
     # --------------------------------------------------------
 
     candidates.sort(
-        key=lambda x: x["score"],
+        key=lambda x: x["rerank_score"],
         reverse=True,
     )
 
@@ -688,12 +725,14 @@ def main():
     print("=" * 80)
 
     model = load_model()
+    reranker = load_reranker()
 
     collection = load_collection()
 
     results = search(
         collection=collection,
         model=model,
+        reranker=reranker,
         query=args.query,
         top_k=args.top_k,
         candidate_k=args.candidate_k,
