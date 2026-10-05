@@ -19,8 +19,8 @@ from src.search import (
     run_agentic_search,
     SentenceTransformer,
     CrossEncoder,
-    chromadb.collection.Collection,
 )
+import chromadb
 from src.ingest import ingest
 from src.chunk_documents import process as chunk_docs
 from src.embed_chunks import process as embed_chunks
@@ -37,7 +37,7 @@ class SystemState:
     def __init__(self):
         self.embedding_model: Optional[SentenceTransformer] = None
         self.reranker: Optional[CrossEncoder] = None
-        self.collection: Optional[Collection] = None
+        self.collection: Optional[chromadb.collection.Collection] = None
 
 state = SystemState()
 

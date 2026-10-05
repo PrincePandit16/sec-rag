@@ -88,8 +88,8 @@ def load_collection():
 # QUERY PARSING
 # ============================================================
 
-def detect_company(query: str) -> str | None:
-
+def detect_companies(query: str) -> list[str]:
+    """Detects all companies mentioned in the query."""
     companies = {
         "apple": "apple",
         "microsoft": "microsoft",
@@ -107,13 +107,14 @@ def detect_company(query: str) -> str | None:
     }
 
     query_lower = query.lower()
+    detected = []
 
     for name, company in companies.items():
-
         if name in query_lower:
-            return company
+            if company not in detected:
+                detected.append(company)
 
-    return None
+    return detected
 
 
 def detect_year(query: str) -> int | None:
@@ -347,6 +348,11 @@ def verify_citations(answer: str, results: list[dict]) -> tuple[bool, str]:
         return True, "Audit failed"
 
 
+def get_fiscal_year_range(year: int) -> tuple[str, str]:
+    """Returns the start and end dates for a given fiscal year."""
+    return f"{year}-01-01", f"{year}-12-31"
+
+
 def build_where_filter(
     company: str | None,
     year: int | None,
@@ -371,18 +377,16 @@ def build_where_filter(
             }
         )
 
-    # IMPORTANT:
-    #
-    # We DON'T directly filter filing_date by year
-    # because filing date and fiscal year are not always
-    # the same thing.
-    #
-    # Example:
-    #
-    # Apple's FY2024 10-K
-    # filing date = 2024-11-01
-    #
-    # Therefore year filtering is handled separately.
+    if year:
+        start_date, end_date = get_fiscal_year_range(year)
+        conditions.append(
+            {
+                "$and": [
+                    {"filing_date": {"$gte": start_date}},
+                    {"filing_date": {"$lte": end_date}},
+                ]
+            }
+        )
 
     if len(conditions) == 0:
 
@@ -594,11 +598,13 @@ def search(
                 )
             )
 
+            # STRICT FILTERING now handled in build_where_filter.
+            # This boost is kept as a secondary signal but reduced.
             if filing_date.startswith(
                 str(year)
             ):
 
-                total_boost += 0.05
+                total_boost += 0.01
 
         score = (
             semantic_score + total_boost
@@ -797,7 +803,7 @@ def run_agentic_search(
     query: str,
     top_k: int = DEFAULT_TOP_K,
     candidate_k: int = DEFAULT_CANDIDATE_K,
-    company: str | None = None,
+    companies: list[str] | str | None = None,
     year: int | None = None,
     form: str | None = None,
 ) -> tuple[list[dict], str | None, str | None]:
@@ -825,7 +831,7 @@ def run_agentic_search(
                 query=q,
                 top_k=top_k,
                 candidate_k=candidate_k,
-                company=company,
+                companies=companies,
                 year=year,
                 form=form,
             )
@@ -875,4 +881,49 @@ def run_agentic_search(
                 audit_report = report
 
     return final_results, synthesized_answer, audit_report
+
+def main():
+    parser = argparse.ArgumentParser(description="SEC Filings RAG Search")
+    parser.add_argument("query", help="The search query")
+    parser.add_argument("--company", help="Filter by company name", default=None)
+    parser.add_argument("--year", type=int, help="Filter by year", default=None)
+    parser.add_argument("--form", help="Filter by SEC form (e.g., 10-K, 10-Q)", default=None)
+    parser.add_argument("--top-k", type=int, help="Number of results to return", default=DEFAULT_TOP_K)
+
+    args = parser.parse_args()
+
+    # Load resources
+    collection = load_collection()
+    model = load_model()
+    reranker = load_reranker()
+
+    # Execute agentic search pipeline
+    results, answer, audit = run_agentic_search(
+        collection=collection,
+        model=model,
+        reranker=reranker,
+        query=args.query,
+        top_k=args.top_k,
+        companies=args.company,
+        year=args.year,
+        form=args.form,
+    )
+
+    # Print the final output
+    print_results(
+        query=args.query,
+        results=results,
+        synthesized_answer=answer,
+    )
+
+    if audit:
+        print("\n" + "!" * 80)
+        print("CITATION AUDIT REPORT")
+        print("!" * 80)
+        print(audit)
+        print("!" * 80)
+
+if __name__ == "__main__":
+    main()
+
 

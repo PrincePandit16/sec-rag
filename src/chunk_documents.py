@@ -149,7 +149,8 @@ def load_documents(input_path: str):
 def make_chunk_id(doc: dict, index: int) -> str:
     company = re.sub(r"[^A-Za-z0-9]+", "", doc.get("company", "UNK"))
     filing_date = doc.get("filing_date", "UNKDATE")
-    return f"{company}_{filing_date}_{index:03d}"
+    document_id = doc.get("document", "UNKDOC")
+    return f"{company}_{filing_date}_{document_id}_{index:03d}"
 
 
 def process(input_path: str, output_path: str, chunk_size: int, overlap: int):
