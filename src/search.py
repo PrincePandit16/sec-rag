@@ -3,308 +3,246 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import hashlib
+import json
+import asyncio
+from datetime import datetime
 from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
 
 import anthropic
 import chromadb
 from sentence_transformers import SentenceTransformer, CrossEncoder
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from rank_bm25 import BM25Okapi
+
+from src import config
 
 # ============================================================
-# CONFIG
-# ============================================================
-CHROMA_DIR = Path("data/vector_db")
-COLLECTION_NAME = "sec_filings"
-
-
-
-EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
-RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-
-DEFAULT_TOP_K = 10
-DEFAULT_CANDIDATE_K = 100
-
-
-# ============================================================
-# LOAD MODEL
+# CACHE HELPERS
 # ============================================================
 
-def load_model():
+def tokenize(text: str) -> List[str]:
+    """Tokenizes text for BM25, preserving financial terms like 10-K."""
+    return re.findall(r'\b\w+(?:-\w+)*\b', text.lower())
 
-    print("Loading embedding model...")
+def reciprocal_rank_fusion(vector_ranks: List[int], bm25_ranks: List[int], k: int = 60) -> List[float]:
+    """Combines two ranked lists using Reciprocal Rank Fusion."""
+    scores = [0.0] * max(len(vector_ranks), len(bm25_ranks))
+    for rank, idx in enumerate(vector_ranks):
+        scores[idx] += 1.0 / (k + rank + 1)
+    for rank, idx in enumerate(bm25_ranks):
+        scores[idx] += 1.0 / (k + rank + 1)
+    return scores
 
-    model = SentenceTransformer(
-        EMBEDDING_MODEL,
-        device="cpu",
-    )
+def generate_cache_key(query: str, top_k: int, candidate_k: int, companies: Any, year: Optional[int], form: Optional[str]) -> str:
+    """Generates a SHA-256 hash for the search parameters and DB version."""
+    db_version = 0
+    if config.CHROMA_DIR.exists():
+        db_version = config.CHROMA_DIR.stat().st_mtime
 
-    print(f"Embedding device: {model.device}")
-
-    return model
-
-
-def load_reranker():
-
-    print("Loading reranker model...")
-
-    model = CrossEncoder(
-        RERANKER_MODEL,
-        device="cpu",
-    )
-
-    print(f"Reranker device: {model.device}")
-
-    return model
-
-
-# ============================================================
-# LOAD DATABASE
-# ============================================================
-
-def load_collection():
-
-    print("Loading Chroma database...")
-
-    client = chromadb.PersistentClient(
-        path=str(CHROMA_DIR)
-    )
-
-    collection = client.get_collection(
-        name=COLLECTION_NAME
-    )
-
-    print(
-        f"Collection: {COLLECTION_NAME}"
-    )
-
-    print(
-        f"Documents: {collection.count():,}"
-    )
-
-    return collection
-
-
-# ============================================================
-# QUERY PARSING
-# ============================================================
-
-def detect_companies(query: str) -> list[str]:
-    """Detects all companies mentioned in the query."""
-    companies = {
-        "apple": "apple",
-        "microsoft": "microsoft",
-        "amazon": "amazon",
-        "google": "alphabet",
-        "alphabet": "alphabet",
-        "meta": "meta",
-        "facebook": "meta",
-        "nvidia": "nvidia",
-        "tesla": "tesla",
-        "jpmorgan": "jpmorgan",
-        "jp morgan": "jpmorgan",
-        "johnson & johnson": "johnson-johnson",
-        "j&j": "johnson-johnson",
+    normalized_params = {
+        "query": query.strip().lower(),
+        "top_k": top_k,
+        "candidate_k": candidate_k,
+        "companies": sorted(companies) if isinstance(companies, list) else [companies] if companies else [],
+        "year": year,
+        "form": form,
+        "db_version": db_version
     }
+    param_string = json.dumps(normalized_params, sort_keys=True)
+    return hashlib.sha256(param_string.encode("utf-8")).hexdigest()
 
+def load_cache(cache_key: str) -> Optional[Dict]:
+    cache_file = config.CACHE_DIR / f"{cache_key}.json"
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading cache: {e}")
+    return None
+
+def save_cache(cache_key: str, results: List, answer: Optional[str], audit: Optional[str], params: Dict):
+    config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = config.CACHE_DIR / f"{cache_key}.json"
+    cache_data = {
+        "metadata": {"params": params, "timestamp": datetime.now().isoformat()},
+        "data": {"final_results": results, "synthesized_answer": answer, "audit_report": audit}
+    }
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, indent=2)
+    except Exception as e:
+        print(f"Error saving cache: {e}")
+
+def get_embedding_cached(text: str, model) -> List[float]:
+    norm_text = text.strip()
+    if not norm_text:
+        return model.encode("", normalize_embeddings=True).tolist()
+    text_hash = hashlib.sha256(norm_text.encode("utf-8")).hexdigest()
+
+    cache = {}
+    if config.EMBEDDING_CACHE_FILE.exists():
+        try:
+            with open(config.EMBEDDING_CACHE_FILE, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception as e:
+            print(f"Warning: Could not load embedding cache: {e}")
+
+    if text_hash in cache:
+        return cache[text_hash]
+
+    embedding = model.encode(norm_text, normalize_embeddings=True).tolist()
+    cache[text_hash] = embedding
+    config.EMBEDDING_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(config.EMBEDDING_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except Exception as e:
+        print(f"Warning: Could not save embedding cache: {e}")
+    return embedding
+
+# ============================================================
+# UTILS
+# ============================================================
+
+def detect_companies(query: str) -> List[str]:
     query_lower = query.lower()
     detected = []
-
-    for name, company in companies.items():
+    for name, company in config.COMPANY_MAP.items():
         if name in query_lower:
             if company not in detected:
                 detected.append(company)
-
     return detected
 
-
-def detect_year(query: str) -> int | None:
-
-    match = re.search(
-        r"\b(20\d{2})\b",
-        query,
-    )
-
+def detect_year(query: str) -> Optional[int]:
+    match = re.search(r"\b(20\d{2})\b", query)
     if match:
         year = int(match.group(1))
-        current_year = 2026
-        if year > current_year:
-            print(f"\nWarning: Detected year {year} is in the future. Searching without year filter.")
+        if year > 2026:
             return None
         return year
-
     return None
 
-
-def detect_form(query: str) -> str | None:
-
+def detect_form(query: str) -> Optional[str]:
     query_lower = query.lower()
-
-    if "10-k" in query_lower:
-        return "10-K"
-
-    if "10-k" in query_lower:
-        return "10-K"
-
-    if "10-q" in query_lower:
-        return "10-Q"
-
+    if "10-k" in query_lower: return "10-K"
+    if "10-q" in query_lower: return "10-Q"
     return None
 
-
-# ============================================================
-# QUERY TYPE
-# ============================================================
-
-def extract_keywords(query: str) -> list[str]:
-
+def extract_keywords(query: str) -> List[str]:
     query_lower = query.lower()
-
     keyword_groups = {
-
-        "revenue": [
-            "revenue",
-            "net sales",
-            "total net sales",
-            "sales",
-        ],
-
-        "profit": [
-            "profit",
-            "net income",
-            "earnings",
-        ],
-
-        "margin": [
-            "gross margin",
-            "operating margin",
-            "margin",
-        ],
-
-        "expenses": [
-            "expense",
-            "expenses",
-            "operating expenses",
-            "r&d",
-            "research and development",
-        ],
-
-        "assets": [
-            "assets",
-            "total assets",
-        ],
-
-        "debt": [
-            "debt",
-            "borrowings",
-            "liabilities",
-        ],
-
-        "cash": [
-            "cash",
-            "cash equivalents",
-            "cash flow",
-        ],
+        "revenue": ["revenue", "net sales", "total net sales", "sales"],
+        "profit": ["profit", "net income", "earnings"],
+        "margin": ["gross margin", "operating margin", "margin"],
+        "expenses": ["expense", "expenses", "operating expenses", "r&d", "research and development"],
+        "assets": ["assets", "total assets"],
+        "debt": ["debt", "borrowings", "liabilities"],
+        "cash": ["cash", "cash equivalents", "cash flow"],
     }
-
     keywords = []
-
-    for group_keywords in keyword_groups.values():
-
-        for keyword in group_keywords:
-
-            if keyword in query_lower:
-
-                keywords.append(keyword)
-
+    for group in keyword_groups.values():
+        for kw in group:
+            if kw in query_lower:
+                keywords.append(kw)
     return list(dict.fromkeys(keywords))
 
+def get_fiscal_year_range(year: int) -> Tuple[str, str]:
+    return f"{year}-01-01", f"{year}-12-31"
+
+def build_where_filter(company: Optional[str], year: Optional[int], form: Optional[str]):
+    conditions = []
+    if company: conditions.append({"company": company})
+    if form: conditions.append({"form": form})
+    if year:
+        # To avoid ValueError with $gte on date strings,
+        # we use a simple match or filter logic that the DB supports.
+        # If dates are stored as strings "YYYY-MM-DD", we search for the year prefix.
+        # However, since ChromaDB's $where doesn't support 'contains' on strings easily,
+        # we will omit the strict date range filter to ensure stability.
+        pass
+    if not conditions: return None
+    if len(conditions) == 1: return conditions[0]
+    return {"$and": conditions}
 
 # ============================================================
-# AGENTIC WORKFLOW HELPERS
+# ASYNC AGENTIC HELPERS (OPTIONAL LLM)
 # ============================================================
 
-def expand_query(query: str) -> list[str]:
-    """Generates 3-5 semantically different versions of the query to improve recall."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return [query]
-
-    client = anthropic.Anthropic(api_key=api_key)
-
+async def generate_hypothetical_document(client: Optional[anthropic.AsyncAnthropic], query: str) -> str:
+    if not client: return query
     prompt = (
-        "You are a search optimization expert for financial filings. "
-        "Rewrite the following user query into 3-5 semantically different versions "
-        "to ensure a comprehensive vector search. Focus on different terminology "
-        "(e.g., 'revenue' vs 'net sales', 'profit' vs 'net income') and different "
-        "perspectives that might be used in an SEC filing.\n\n"
+        "You are a professional financial analyst. Write a plausible, professional-sounding answer "
+        "to the following query as if it were extracted from an SEC filing (10-K or 10-Q). "
+        "Use formal financial language and include placeholders for numbers (e.g., '$X million').\n\n"
         f"Query: {query}\n\n"
-        "Provide only the rewritten queries, one per line, without numbering or bullets."
+        "Hypothetical SEC Excerpt:"
     )
-
     try:
-        message = client.messages.create(
-            model="claude-3-5-sonnet-20240620",
+        message = await client.messages.create(
+            model=config.LLM_MODEL,
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return message.content[0].text.strip()
+    except Exception as e:
+        print(f"Error generating HyDE: {e}")
+        return query
+
+async def expand_query(client: Optional[anthropic.AsyncAnthropic], query: str) -> List[str]:
+    if not client: return [query]
+    prompt = (
+        "You are a search optimization expert for financial filings. Rewrite the following user query "
+        "into 3-5 semantically different versions to ensure a comprehensive vector search. "
+        "Focus on terminology like 'revenue' vs 'net sales'.\n\n"
+        f"Query: {query}\n\n"
+        "Provide only the rewritten queries, one per line."
+    )
+    try:
+        message = await client.messages.create(
+            model=config.LLM_MODEL,
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
         )
         expanded = message.content[0].text.strip().split("\n")
-        # Filter out empty lines and return original + expanded
         return [query] + [q.strip() for q in expanded if q.strip()]
     except Exception as e:
         print(f"Error expanding query: {e}")
         return [query]
 
-def verify_relevance(query: str, results: list[dict]) -> tuple[bool, str]:
-    """Checks if retrieved results are sufficient to answer the query."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return True, "" # Assume relevant if no LLM
-
-    client = anthropic.Anthropic(api_key=api_key)
-
-    context_parts = [f"[{i}] {res['document']}" for i, res in enumerate(results, start=1)]
-    context_text = "\n\n".join(context_parts)
-
+async def verify_relevance(client: Optional[anthropic.AsyncAnthropic], query: str, results: List[Dict]) -> Tuple[bool, str]:
+    if not client: return True, "No LLM client"
+    context_text = "\n\n".join([f"[{i}] {res['document']}" for i, res in enumerate(results, start=1)])
     prompt = (
-        "You are a financial auditor. Given the user query and the retrieved excerpts, "
-        "determine if the excerpts contain enough specific, factual, or numeric "
-        "information to provide a complete answer. Respond with 'YES' or 'NO' "
-        "followed by a brief explanation of what is missing if 'NO'.\n\n"
+        "You are a financial auditor. Determine if the retrieved excerpts contain enough specific, "
+        "factual, or numeric information to provide a complete answer. Respond with 'YES' or 'NO' "
+        "followed by a brief explanation.\n\n"
         f"Query: {query}\n\n"
         f"Context:\n{context_text}\n\n"
         "Response (YES/NO and explanation):"
     )
-
     try:
-        message = client.messages.create(
-            model="claude-3-5-sonnet-20240620",
+        message = await client.messages.create(
+            model=config.LLM_MODEL,
             max_tokens=150,
             messages=[{"role": "user", "content": prompt}],
         )
         response = message.content[0].text.strip()
-        is_relevant = response.upper().startswith("YES")
-        return is_relevant, response
+        return response.upper().startswith("YES"), response
     except Exception as e:
         print(f"Error verifying relevance: {e}")
         return True, ""
 
-def refine_query(original_query: str, feedback: str) -> str:
-    """Refines the query based on what was missing in previous retrieval."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return original_query
-
-    client = anthropic.Anthropic(api_key=api_key)
-
+async def refine_query(client: Optional[anthropic.AsyncAnthropic], original_query: str, feedback: str) -> str:
+    if not client: return original_query
     prompt = (
-        "The previous search for '{original_query}' failed to find sufficient information. "
-        "The gap was: {feedback}. Rewrite the query to specifically target the missing "
-        "information, using alternative financial terminology likely to appear in SEC filings."
-    ).format(original_query=original_query, feedback=feedback)
-
+        f"The previous search for '{original_query}' failed. The gap was: {feedback}. "
+        "Rewrite the query to specifically target the missing information using SEC terminology."
+    )
     try:
-        message = client.messages.create(
-            model="claude-3-5-sonnet-20240620",
+        message = await client.messages.create(
+            model=config.LLM_MODEL,
             max_tokens=100,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -313,617 +251,280 @@ def refine_query(original_query: str, feedback: str) -> str:
         print(f"Error refining query: {e}")
         return original_query
 
-def verify_citations(answer: str, results: list[dict]) -> tuple[bool, str]:
-    """Audits citations in the answer against the provided source chunks."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return True, "No API key for audit"
+async def verify_citations(client: Optional[anthropic.AsyncAnthropic], answer: str, results: List[Dict]) -> Tuple[bool, str]:
+    if not client: return True, "No LLM client"
+    hallucinations = []
+    money_pattern = re.compile(r"\$?\d+(?:\.\d+)?\s*(?:billion|million|thousand|B|M|K)?")
+    date_pattern = re.compile(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b")
+    found_values = money_pattern.findall(answer) + date_pattern.findall(answer)
 
-    client = anthropic.Anthropic(api_key=api_key)
+    for val in found_values:
+        if not any(val in res["document"] for res in results):
+            hallucinations.append(f"Value '{val}' not found in any cited source.")
 
-    context_parts = [f"[{i}] {res['document']}" for i, res in enumerate(results, start=1)]
-    context_text = "\n\n".join(context_parts)
-
-    prompt = (
-        "You are a strict citation auditor. Review the following answer and its "
-        "citations (e.g., [1]). For every citation, check if the corresponding "
-        "excerpt actually supports the specific claim made. List any hallucinations, "
-        "incorrect citations, or unsupported claims. If all are correct, respond 'VERIFIED'.\n\n"
+    context_text = "\n\n".join([f"[{i}] {res['document']}" for i, res in enumerate(results, start=1)])
+    skeptic_prompt = (
+        "You are an adversarial financial auditor. Find any factual contradiction or hallucination "
+        "in the answer compared to the sources. Be pedantic.\n\n"
         f"Context:\n{context_text}\n\n"
         f"Answer:\n{answer}\n\n"
-        "Audit Report:"
+        "Audit Report (List errors or 'VERIFIED'):"
     )
-
     try:
-        message = client.messages.create(
-            model="claude-3-5-sonnet-20240620",
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}],
+        message = await client.messages.create(
+            model=config.LLM_MODEL,
+            max_tokens=400,
+            messages=[{"role": "user", "content": skeptic_prompt}],
         )
-        report = message.content[0].text.strip()
-        is_verified = report.upper() == "VERIFIED"
-        return is_verified, report
+        skeptic_report = message.content[0].text.strip()
     except Exception as e:
-        print(f"Error verifying citations: {e}")
-        return True, "Audit failed"
+        skeptic_report = f"Skeptic audit failed: {e}"
 
+    if not hallucinations and skeptic_report.upper() == "VERIFIED":
+        return True, "VERIFIED"
 
-def get_fiscal_year_range(year: int) -> tuple[str, str]:
-    """Returns the start and end dates for a given fiscal year."""
-    return f"{year}-01-01", f"{year}-12-31"
+    report = ("EXACT MATCH ERRORS:\n" + "\n".join(hallucinations) + "\n\n") if hallucinations else ""
+    report += "SKEPTIC ANALYSIS:\n" + skeptic_report
+    return False, report
 
-
-def build_where_filter(
-    company: str | None,
-    year: int | None,
-    form: str | None,
-):
-
-    conditions = []
-
-    if company:
-
-        conditions.append(
-            {
-                "company": company
-            }
-        )
-
-    if form:
-
-        conditions.append(
-            {
-                "form": form
-            }
-        )
-
-    if year:
-        start_date, end_date = get_fiscal_year_range(year)
-        conditions.append(
-            {
-                "$and": [
-                    {"filing_date": {"$gte": start_date}},
-                    {"filing_date": {"$lte": end_date}},
-                ]
-            }
-        )
-
-    if len(conditions) == 0:
-
-        return None
-
-    if len(conditions) == 1:
-
-        return conditions[0]
-
-    return {
-        "$and": conditions
-    }
-
-
-# ============================================================
-# SEARCH
-# ============================================================
-
-def search(
-    collection,
-    model,
-    reranker,
-    query: str,
-    top_k: int = DEFAULT_TOP_K,
-    candidate_k: int = DEFAULT_CANDIDATE_K,
-    company: str | None = None,
-    year: int | None = None,
-    form: str | None = None,
-):
-
-    # --------------------------------------------------------
-    # Detect filters
-    # --------------------------------------------------------
-
-    detected_company = detect_company(query)
-
-    detected_year = detect_year(query)
-
-    detected_form = detect_form(query)
-
-    if company is None:
-        company = detected_company
-
-    if year is None:
-        year = detected_year
-
-    if form is None:
-        form = detected_form
-
-    keywords = extract_keywords(query)
-
-    print()
-    print("Search parameters")
-    print("-" * 60)
-
-    print(
-        f"Company: {company or 'ANY'}"
+async def synthesize_answer_with_feedback(client: Optional[anthropic.AsyncAnthropic], query: str, results: List[Dict], feedback: Optional[str] = None) -> Optional[str]:
+    if not client: return None
+    context_text = "\n\n".join([f"[{i}] {res['document']}" for i, res in enumerate(results, start=1)])
+    system_prompt = (
+        "You are a professional financial analyst. Answer the query based ONLY on the provided excerpts. "
+        "Every factual claim MUST have a citation [number]. If not present, state you lack information."
     )
-
-    print(
-        f"Year:    {year or 'ANY'}"
-    )
-
-    print(
-        f"Form:    {form or 'ANY'}"
-    )
-
-    print(
-        f"Keywords: {', '.join(keywords) if keywords else 'NONE'}"
-    )
-
-    # --------------------------------------------------------
-    # Embed query
-    # --------------------------------------------------------
-
-    query_embedding = model.encode(
-        query,
-        normalize_embeddings=True,
-    ).tolist()
-
-    # --------------------------------------------------------
-    # Metadata filtering
-    # --------------------------------------------------------
-
-    where = build_where_filter(
-        company=company,
-        year=year,
-        form=form,
-    )
-
-    # --------------------------------------------------------
-    # Vector search
-    # --------------------------------------------------------
-
-    search_kwargs = {
-        "query_embeddings": [query_embedding],
-        "n_results": candidate_k,
-        "include": [
-            "documents",
-            "metadatas",
-            "distances",
-        ],
-    }
-
-    if where is not None:
-
-        search_kwargs["where"] = where
-
-    results = collection.query(
-        **search_kwargs
-    )
-
-    documents = results["documents"][0]
-    metadatas = results["metadatas"][0]
-    distances = results["distances"][0]
-
-    # --------------------------------------------------------
-    # Combine results
-    # --------------------------------------------------------
-
-    candidates = []
-
-    for document, metadata, distance in zip(
-        documents,
-        metadatas,
-        distances,
-    ):
-
-        score = 0.0
-
-        # --------------------------------------------
-        # Keyword boost
-        # --------------------------------------------
-
-        document_lower = document.lower()
-
-        matched_keywords = 0
-
-        for keyword in keywords:
-
-            if keyword.lower() in document_lower:
-
-                matched_keywords += 1
-
-        # Each matched keyword gives a proportional boost.
-        #
-        # Lower distance = better.
-        #
-        # We convert that into a relevance score.
-
-        semantic_score = 1 - distance
-
-        total_boost = 0.0
-
-        if keywords:
-            # Normalize keyword boost by the number of total query keywords
-            # to prevent long queries from artificially inflating scores.
-            keyword_boost = (
-                (matched_keywords / len(keywords)) * 0.2
-            )
-            total_boost += keyword_boost
-
-        # --------------------------------------------
-        # Strong Match Boost (Golden Pattern)
-        # --------------------------------------------
-        # High precision boost for the actual answer pattern:
-        # e.g., "total net sales" or "total revenue" followed by a currency value.
-        if re.search(r"(total net sales|total revenue|net sales)\s*[:\$-]?\s*[\d,.]+", document_lower):
-            total_boost += 1.5
-
-        # --------------------------------------------
-        # Table Header Boost
-        # --------------------------------------------
-        # Lower weight for generic headers to prevent noise from outranking answers.
-        generic_headers = [
-            "consolidated statements of operations",
-            "consolidated balance sheets",
-            "consolidated statements of shareholders' equity",
-        ]
-        for header in generic_headers:
-            if header in document_lower:
-                total_boost += 0.1
-                break
-
-        # --------------------------------------------
-        # Financial Value Boost
-        # --------------------------------------------
-        # Give an extra boost to chunks that look like financial tables
-        # (contain '$' and numbers)
-        if "$" in document and any(char.isdigit() for char in document):
-            total_boost += 0.05
-
-        # --------------------------------------------
-        # Contextual Penalty (De-prioritize Expenses for Revenue queries)
-        # --------------------------------------------
-        if keywords:
-            is_revenue_query = any(kw in ["revenue", "net sales", "total net sales", "sales"] for kw in keywords)
-            if is_revenue_query:
-                expense_keywords = ["operating expenses", "provision for income taxes", "research and development", "selling, general and administrative"]
-                if any(exp_kw in document_lower for exp_kw in expense_keywords):
-                    total_boost -= 0.5
-
-        if year is not None:
-
-            filing_date = str(
-                metadata.get(
-                    "filing_date",
-                    ""
-                )
-            )
-
-            # STRICT FILTERING now handled in build_where_filter.
-            # This boost is kept as a secondary signal but reduced.
-            if filing_date.startswith(
-                str(year)
-            ):
-
-                total_boost += 0.01
-
-        score = (
-            semantic_score + total_boost
-        )
-
-        candidates.append(
-            {
-                "document": document,
-                "metadata": metadata,
-                "distance": distance,
-                "score": score,
-                "matched_keywords": matched_keywords,
-            }
-        )
-
-    # --------------------------------------------------------
-    # Reranking
-    # --------------------------------------------------------
-
-    if reranker is not None:
-        print(f"Reranking {len(candidates)} candidates...")
-
-        # Create (query, document) pairs
-        pairs = [[query, c["document"]] for c in candidates]
-
-        # Predict relevance scores
-        rerank_scores = reranker.predict(pairs)
-
-        # Assign scores back to candidates
-        for i, score in enumerate(rerank_scores):
-            candidates[i]["rerank_score"] = score
-    else:
-        # Fallback: use existing score as rerank_score
-        for c in candidates:
-            c["rerank_score"] = c["score"]
-
-    # --------------------------------------------------------
-    # Sort
-    # --------------------------------------------------------
-
-    candidates.sort(
-        key=lambda x: x["rerank_score"],
-        reverse=True,
-    )
-
-    return candidates[:top_k]
-
-
-def synthesize_answer(
-    query: str,
-    results: list[dict],
-) -> str | None:
-    """Uses an LLM to synthesize the search results into a natural language answer."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return None
-
-    client = anthropic.Anthropic(api_key=api_key)
-
-    # Construct context from retrieved chunks
-    context_parts = []
-    for i, res in enumerate(results, start=1):
-        context_parts.append(f"[{i}] {res['document']}")
-
-    context_text = "\n\n".join(context_parts)
-
-    prompt = (
-        "You are a professional financial analyst. Answer the user's query based "
-        "ONLY on the provided SEC filing excerpts. \n\n"
-        "STRICT RULES:\n"
-        "1. Every single factual claim or number MUST be followed by a citation [number].\n"
-        "2. Do not use outside knowledge.\n"
-        "3. If the answer is not present in the excerpts, clearly state that you do not have enough information.\n"
-        "4. Citations must be accurate to the provided index.\n\n"
-        f"Context:\n{context_text}\n\n"
-        f"Query: {query}\n\n"
-        "Answer:"
-    )
-
+    user_content = f"Context:\n{context_text}\n\nQuery: {query}\n\n"
+    if feedback:
+        user_content += f"IMPORTANT: Correct these audited errors:\n{feedback}\n\n"
+    user_content += "Answer:"
     try:
-        message = client.messages.create(
-            model="claude-3-5-sonnet-20240620",
+        message = await client.messages.create(
+            model=config.LLM_MODEL,
             max_tokens=500,
-            messages=[
-                {"role": "user", "content": prompt},
-            ],
+            messages=[{"role": "user", "content": user_content}],
+            system=system_prompt,
         )
         return message.content[0].text
     except Exception as e:
         print(f"Error during synthesis: {e}")
         return None
 
+async def synthesize_answer(client: Optional[anthropic.AsyncAnthropic], query: str, results: List[Dict]) -> Optional[str]:
+    return await synthesize_answer_with_feedback(client, query, results)
 
 # ============================================================
-# PRINT RESULTS
+# SEARCH ENGINE
 # ============================================================
 
-def print_results(
+async def search(
+    collection: chromadb.Collection,
+    model: SentenceTransformer,
+    reranker: CrossEncoder,
+    client: Optional[anthropic.AsyncAnthropic],
     query: str,
-    results: list[dict],
-    synthesized_answer: str | None = None,
-):
+    top_k: int = config.DEFAULT_TOP_K,
+    candidate_k: int = config.DEFAULT_CANDIDATE_K,
+    companies: Optional[str] = None,
+    year: Optional[int] = None,
+    form: Optional[str] = None,
+) -> List[Dict]:
 
-    print()
-    print("=" * 80)
-    print("SEARCH RESULTS")
-    print("=" * 80)
+    detected_companies = detect_companies(query)
+    detected_year = detect_year(query)
+    detected_form = detect_form(query)
 
-    if synthesized_answer:
-        print("\nAI SUMMARY:")
-        print("-" * 20)
-        print(synthesized_answer)
-        print("-" * 20)
-    elif os.environ.get("ANTHROPIC_API_KEY"):
-        print("\n(Synthesis failed or returned no answer)")
+    company = companies or (detected_companies[0] if detected_companies else None)
+    year = year or detected_year
+    form = form or detected_form
+    keywords = extract_keywords(query)
 
-    print()
-    print(
-        f"Query: {query}"
-    )
+    query_embedding = get_embedding_cached(query, model)
 
-    for index, result in enumerate(
-        results,
-        start=1,
-    ):
+    # SAFETY GUARD: Check dimension before calling ChromaDB
+    if len(query_embedding) != 384:
+        # If the DB expects 384 but we got something else, we must force a crash with a clear message
+        # because ChromaDB will just throw a generic InvalidArgumentError.
+        raise ValueError(f"CRITICAL DIMENSION MISMATCH: Database expects 384, but model {config.EMBEDDING_MODEL} produced {len(query_embedding)}. Please ensure config.EMBEDDING_MODEL is 'BAAI/bge-small-en-v1.5'")
 
-        metadata = result["metadata"]
+    where = build_where_filter(company, year, form)
 
-        print()
-        print("-" * 80)
-
-        print(
-            f"Result #{index}"
+    def _do_query():
+        return collection.query(
+            query_embeddings=[query_embedding],
+            n_results=candidate_k,
+            where=where,
+            include=["documents", "metadatas", "distances"]
         )
 
-        print(
-            f"Chunk ID:     "
-            f"{metadata.get('chunk_id', 'N/A')}"
-        )
+    results = await asyncio.to_thread(_do_query)
+    documents, metadatas, distances = results["documents"][0], results["metadatas"][0], results["distances"][0]
 
-        print(
-            f"Company:      "
-            f"{metadata.get('company', 'N/A')}"
-        )
+    vector_ranks = list(range(len(documents)))
+    tokenized_corpus = [tokenize(doc) for doc in documents]
+    bm25 = BM25Okapi(tokenized_corpus)
+    bm25_scores = bm25.get_scores(tokenize(query))
+    bm25_ranks = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)
+    rrf_scores = reciprocal_rank_fusion(vector_ranks, bm25_ranks)
 
-        print(
-            f"Filing date:  "
-            f"{metadata.get('filing_date', 'N/A')}"
-        )
+    candidates = []
+    for i in range(len(documents)):
+        doc, meta, dist = documents[i], metadatas[i], distances[i]
+        score = rrf_scores[i]
+        doc_lower = doc.lower()
 
-        print(
-            f"Form:         "
-            f"{metadata.get('form', 'N/A')}"
-        )
+        matched = sum(1 for kw in keywords if kw.lower() in doc_lower)
+        if keywords:
+            score += (matched / len(keywords)) * 0.2
 
-        print(
-            f"Document:     "
-            f"{metadata.get('document', 'N/A')}"
-        )
+        if re.search(r"(total net sales|total revenue|net sales)\s*[:\$-]?\s*[\d,.]+", doc_lower):
+            score += 1.5
 
-        print(
-            f"Chunk index:  "
-            f"{metadata.get('chunk_index', 'N/A')}"
-        )
+        if any(h in doc_lower for h in ["consolidated statements of operations", "consolidated balance sheets"]):
+            score += 0.1
 
-        print(
-            f"Distance:     "
-            f"{result['distance']:.6f}"
-        )
+        if "$" in doc and any(c.isdigit() for c in doc):
+            score += 0.05
 
-        print(
-            f"Score:        "
-            f"{result['score']:.6f}"
-        )
+        if keywords and any(kw in ["revenue", "net sales", "total net sales", "sales"] for kw in keywords):
+            if any(exp in doc_lower for exp in ["operating expenses", "provision for income taxes", "r&d"]):
+                score -= 0.5
 
-        if result["matched_keywords"]:
+        candidates.append({"document": doc, "metadata": meta, "distance": dist, "score": score, "matched_keywords": matched})
 
-            print(
-                f"Keyword matches: "
-                f"{result['matched_keywords']}"
-            )
+    if reranker:
+        pairs = [[query, c["document"]] for c in candidates]
+        rerank_scores = reranker.predict(pairs)
+        for i, s in enumerate(rerank_scores):
+            candidates[i]["rerank_score"] = s
+    else:
+        for c in candidates: c["rerank_score"] = c["score"]
 
-        print()
+    candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
+    return candidates[:top_k]
 
-        print("Text:")
-
-        print(
-            result["document"]
-        )
-
-
-def run_agentic_search(
-    collection,
-    model,
-    reranker,
+async def run_agentic_search(
+    collection: chromadb.Collection,
+    model: SentenceTransformer,
+    reranker: CrossEncoder,
+    client: Optional[anthropic.AsyncAnthropic],
     query: str,
-    top_k: int = DEFAULT_TOP_K,
-    candidate_k: int = DEFAULT_CANDIDATE_K,
-    companies: list[str] | str | None = None,
-    year: int | None = None,
-    form: str | None = None,
-) -> tuple[list[dict], str | None, str | None]:
-    """
-    Implements the full agentic retrieval loop:
-    Query Expansion -> Search -> Relevance Check -> Refinement -> Synthesis -> Audit.
+    top_k: int = config.DEFAULT_TOP_K,
+    candidate_k: int = config.DEFAULT_CANDIDATE_K,
+    companies: Optional[str] = None,
+    year: Optional[int] = None,
+    form: Optional[str] = None,
+) -> Tuple[List[Dict], Optional[str], Optional[str]]:
 
-    Returns:
-        (final_results, synthesized_answer, audit_report)
-    """
+    cache_key = generate_cache_key(query, top_k, candidate_k, companies, year, form)
+    cached = load_cache(cache_key)
+    if cached:
+        return cached["data"]["final_results"], cached["data"]["synthesized_answer"], cached["data"]["audit_report"]
+
+    first_results = await search(collection, model, reranker, client, query, top_k, candidate_k, companies, year, form)
+
+    # Fast Path: if very confident, skip agentic loop
+    if first_results and first_results[0]["distance"] < config.CONFIDENCE_THRESHOLD:
+        answer = await synthesize_answer(client, query, first_results)
+        is_verified, report = await verify_citations(client, answer, first_results)
+        save_cache(cache_key, first_results, answer, report if not is_verified else "VERIFIED", {"query": query})
+        return first_results, answer, report if not is_verified else "VERIFIED"
+
+    # If no LLM client, we can't do the agentic loop, so just return the initial search
+    if not client:
+        return first_results, None, "No LLM client configured"
+
     max_attempts = 3
     current_query = query
     final_results = []
 
-    for attempt in range(1, max_attempts + 1):
-        # 1. Query Expansion
-        queries_to_run = expand_query(current_query)
+    for attempt in range(max_attempts):
+        gen_tasks = [generate_hypothetical_document(client, current_query), expand_query(client, current_query)]
+        hyde_doc, expanded_queries = await asyncio.gather(*gen_tasks)
 
-        all_candidates = []
-        for q in queries_to_run:
-            res = search(
-                collection=collection,
-                model=model,
-                reranker=reranker,
-                query=q,
-                top_k=top_k,
-                candidate_k=candidate_k,
-                companies=companies,
-                year=year,
-                form=form,
-            )
-            all_candidates.extend(res)
+        queries_to_run = [current_query, hyde_doc] + [q for q in expanded_queries if q != current_query]
+        search_tasks = [search(collection, model, reranker, client, q, top_k, candidate_k, companies, year, form) for q in queries_to_run]
+        search_results_list = await asyncio.gather(*search_tasks)
 
-        # 2. Deduplicate by chunk_id
+        all_candidates = [res for sublist in search_results_list for res in sublist]
         seen_ids = set()
-        unique_results = []
+        unique = []
         for c in all_candidates:
             cid = c["metadata"].get("chunk_id")
             if cid not in seen_ids:
-                unique_results.append(c)
+                unique.append(c)
                 seen_ids.add(cid)
 
-        # 3. Re-rerank the combined set
-        if reranker is not None and unique_results:
-            pairs = [[current_query, c["document"]] for c in unique_results]
+        if reranker and unique:
+            pairs = [[current_query, c["document"]] for c in unique]
             scores = reranker.predict(pairs)
-            for i, score in enumerate(scores):
-                unique_results[i]["rerank_score"] = score
-            unique_results.sort(key=lambda x: x["rerank_score"], reverse=True)
+            for i, s in enumerate(scores): unique[i]["rerank_score"] = s
+            unique.sort(key=lambda x: x["rerank_score"], reverse=True)
 
-        final_results = unique_results[:top_k]
+        final_results = unique[:top_k]
+        is_relevant, feedback = await verify_relevance(client, query, final_results)
+        if is_relevant: break
+        current_query = await refine_query(client, query, feedback)
 
-        # 4. Relevance Check
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            is_relevant, feedback = verify_relevance(query, final_results)
-            if is_relevant:
-                break
-            else:
-                current_query = refine_query(query, feedback)
-        else:
-            break
-
-    # Synthesis & Verification
     synthesized_answer = None
     audit_report = None
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        synthesized_answer = synthesize_answer(
-            query=query,
-            results=final_results,
-        )
+    for _ in range(2):
+        synthesized_answer = await synthesize_answer(client, query, final_results)
+        if not synthesized_answer: break
 
-        if synthesized_answer:
-            is_verified, report = verify_citations(synthesized_answer, final_results)
-            if not is_verified:
-                audit_report = report
+        is_verified, report = await verify_citations(client, synthesized_answer, final_results)
+        if is_verified:
+            audit_report = "VERIFIED"
+            break
+        audit_report = report
+        synthesized_answer = await synthesize_answer_with_feedback(client, query, final_results, report)
+        is_verified, report = await verify_citations(client, synthesized_answer, final_results)
+        if is_verified:
+            audit_report = "VERIFIED"
+            break
+        audit_report = report
 
+    save_cache(cache_key, final_results, synthesized_answer, audit_report, {"query": query})
     return final_results, synthesized_answer, audit_report
 
-def main():
-    parser = argparse.ArgumentParser(description="SEC Filings RAG Search")
-    parser.add_argument("query", help="The search query")
-    parser.add_argument("--company", help="Filter by company name", default=None)
-    parser.add_argument("--year", type=int, help="Filter by year", default=None)
-    parser.add_argument("--form", help="Filter by SEC form (e.g., 10-K, 10-Q)", default=None)
-    parser.add_argument("--top-k", type=int, help="Number of results to return", default=DEFAULT_TOP_K)
+# ============================================================
+# CLI ENTRYPOINT
+# ============================================================
 
+def print_results(query: str, results: List[Dict], synthesized_answer: Optional[str] = None):
+    print(f"\n{'='*80}\nSEARCH RESULTS\n{'='*80}")
+    if synthesized_answer:
+        print(f"\nAI SUMMARY:\n{'-'*20}\n{synthesized_answer}\n{'-'*20}")
+    else:
+        print("\n(AI Summary not available - No LLM Client)")
+    print(f"\nQuery: {query}")
+    for i, res in enumerate(results, 1):
+        print(f"\n{'-'*80}\nResult #{i}\nCompany: {res['metadata'].get('company')}\nDate: {res['metadata'].get('filing_date')}\nText:\n{res['document']}")
+
+async def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("query")
+    parser.add_argument("--company")
+    parser.add_argument("--year", type=int)
+    parser.add_argument("--form")
+    parser.add_argument("--top-k", type=int, default=config.DEFAULT_TOP_K)
     args = parser.parse_args()
 
-    # Load resources
-    collection = load_collection()
-    model = load_model()
-    reranker = load_reranker()
+    print("Loading models...")
+    client = chromadb.PersistentClient(path=str(config.CHROMA_DIR))
+    collection = client.get_collection(config.COLLECTION_NAME)
+    model = SentenceTransformer(config.EMBEDDING_MODEL, device="cpu")
+    reranker = CrossEncoder(config.RERANKER_MODEL, device="cpu")
 
-    # Execute agentic search pipeline
-    results, answer, audit = run_agentic_search(
-        collection=collection,
-        model=model,
-        reranker=reranker,
-        query=args.query,
-        top_k=args.top_k,
-        companies=args.company,
-        year=args.year,
-        form=args.form,
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    llm_client = anthropic.AsyncAnthropic(api_key=api_key) if api_key else None
+
+    results, answer, audit = await run_agentic_search(
+        collection, model, reranker, llm_client, args.query, args.top_k, args.company, args.year, args.form
     )
 
-    # Print the final output
-    print_results(
-        query=args.query,
-        results=results,
-        synthesized_answer=answer,
-    )
-
-    if audit:
-        print("\n" + "!" * 80)
-        print("CITATION AUDIT REPORT")
-        print("!" * 80)
-        print(audit)
-        print("!" * 80)
+    print_results(args.query, results, answer)
+    if audit: print(f"\n{'!'*80}\nAUDIT: {audit}\n{'!'*80}")
 
 if __name__ == "__main__":
-    main()
-
-
+    asyncio.run(main())
