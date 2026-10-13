@@ -1,0 +1,46 @@
+Loading models...
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights: 100%|##########| 199/199 [00:00<00:00, 2366.19it/s]
+Loading weights:   0%|          | 0/105 [00:00<?, ?it/s]Loading weights: 100%|##########| 105/105 [00:00<00:00, 1652.83it/s]
+LLM Error: (Request ID: Root=1-6ace3b18-24bc9d21306a902c444269de;c07d236e-e01f-44f3-89c8-7de16bad748d)
+
+Bad request:
+{'message': "The requested model 'meta-llama/Meta-Llama-3-8B-Instruct' is not supported by any provider you have enabled.", 'type': 'invalid_request_error', 'param': 'model', 'code': 'model_not_supported'}
+LLM Error: (Request ID: Root=1-6ace3b18-50df34f403ae9aef2153bcd0;15aeebd3-717a-4841-9c1c-9c07d8971913)
+
+Bad request:
+{'message': "The requested model 'meta-llama/Meta-Llama-3-8B-Instruct' is not supported by any provider you have enabled.", 'type': 'invalid_request_error', 'param': 'model', 'code': 'model_not_supported'}
+Error verifying relevance: 'LLMClient' object has no attribute 'messages'
+Error during synthesis: 'LLMClient' object has no attribute 'messages'
+
+================================================================================
+SEARCH RESULTS
+================================================================================
+
+(AI Summary not available - No LLM Client)
+
+Query: What was Apple's total net sales in 2023?
+
+--------------------------------------------------------------------------------
+Result #1
+Company: apple
+Date: 2023-11-03
+Text:
+ Company’s total net sales were $383.3 billion and net income was $97.0 billion during 2023. The Company’s total net sales decreased 3% or $11.0 billion during 2023 compared to 2022. The weakness in foreign currencies relative to the U.S. dollar accounted for more than the entire year-over-year decrease in total net sales, which consisted primarily of lower net sales of Mac and iPhone, partially offset by higher net sales of Services. The Company announces new product, service and software offerings at various times during the year. Significant announcements during fiscal year 2023 included the following: First Quarter 2023: • iPad and iPad Pro; • Next-generation Apple TV 4K; and • MLS Season Pass, a Major League Soccer subscription streaming service. Second Quarter 2023: • MacBook Pro 14”, MacBook Pro 16” and Mac mini; and • Second-generation HomePod. Third Quarter 2023: • MacBook Air 15”, Mac Studio and Mac Pro; • Apple Vision Pro™, the Company’s first spatial computer featuring its new visionOS™, expected to be available in early calendar year 2024; and • iOS 17, macOS Sonoma, iPadOS 17, tvOS 17 and watchOS 10, updates to the Company’s operating systems. Fourth Quarter 2023: • iPhone 15, iPhone 15 Plus, iPhone 15 Pro and iPhone 15 Pro Max; and • Apple Watch Series 9 and Apple Watch Ultra 2. In May 2023, the Company announced a new share repurchase program of up to $90 billion and raised its quarterly dividend from $0.23 to $0.24 per share beginning in May 2023. During 2023, the Company repurchased $76.6 billion of its common stock and paid dividends and dividend equivalents of $15.0 billion. Macroeconomic Conditions Macroeconomic conditions, including
+Loading models...
+Loading weights:   0%|          | 0/199 [00:00<?, ?it/s]Loading weights:   8%|7         | 15/199 [00:00<00:01, 101.34it/s]Loading weights: 100%|##########| 199/199 [00:00<00:00, 1145.15it/s]
+Loading weights:   0%|          | 0/105 [00:00<?, ?it/s]Loading weights: 100%|##########| 105/105 [00:00<00:00, 1403.74it/s]
+
+================================================================================
+SEARCH RESULTS
+================================================================================
+
+(AI Summary not available - No LLM Client)
+
+Query: What was Apple's total net sales in 2023?
+
+--------------------------------------------------------------------------------
+Result #1
+Company: apple
+Date: 2023-11-03
+Text:
+ Company’s total net sales were $383.3 billion and net income was $97.0 billion during 2023. The Company’s total net sales decreased 3% or $11.0 billion during 2023 compared to 2022. The weakness in foreign currencies relative to the U.S. dollar accounted for more than the entire year-over-year decrease in total net sales, which consisted primarily of lower net sales of Mac and iPhone, partially offset by higher net sales of Services. The Company announces new product, service and software offerings at various times during the year. Significant announcements during fiscal year 2023 included the following: First Quarter 2023: • iPad and iPad Pro; • Next-generation Apple TV 4K; and • MLS Season Pass, a Major League Soccer subscription streaming service. Second Quarter 2023: • MacBook Pro 14”, MacBook Pro 16” and Mac mini; and • Second-generation HomePod. Third Quarter 2023: • MacBook Air 15”, Mac Studio and Mac Pro; • Apple Vision Pro™, the Company’s first spatial computer featuring its new visionOS™, expected to be available in early calendar year 2024; and • iOS 17, macOS Sonoma, iPadOS 17, tvOS 17 and watchOS 10, updates to the Company’s operating systems. Fourth Quarter 2023: • iPhone 15, iPhone 15 Plus, iPhone 15 Pro and iPhone 15 Pro Max; and • Apple Watch Series 9 and Apple Watch Ultra 2. In May 2023, the Company announced a new share repurchase program of up to $90 billion and raised its quarterly dividend from $0.23 to $0.24 per share beginning in May 2023. During 2023, the Company repurchased $76.6 billion of its common stock and paid dividends and dividend equivalents of $15.0 billion. Macroeconomic Conditions Macroeconomic conditions, including

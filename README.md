@@ -36,14 +36,16 @@ cd sec-rag
 
 # Install dependencies
 uv sync
-# OR
-pip install -r requirements.txt
+# For the optional RAG evaluation tools:
+uv sync --extra evaluation
 ```
 
 ### Environment Variables
-To use the AI synthesis feature, add your Anthropic API key:
+Set a Groq API key to enable AI synthesis and agentic search. An Anthropic key is
+optional and is used only to summarize tables during filing ingestion.
 ```bash
-export ANTHROPIC_API_KEY='your-api-key-here'
+export GROQ_API_KEY='your-groq-api-key-here'
+export ANTHROPIC_API_KEY='your-anthropic-api-key-here'
 ```
 
 ## 💻 Usage
@@ -51,10 +53,22 @@ export ANTHROPIC_API_KEY='your-api-key-here'
 ### Running the Pipeline
 To build the database from scratch:
 ```bash
-python src/download_filings.py
-python src/chunk_documents.py
-python src/embed_chunks.py
-python src/ingest.py
+uv run python -m src.download_filings
+uv run python -m src.ingest
+uv run python -m src.chunk_documents
+uv run python -m src.embed_chunks
+uv run python -m src.validate_embeddings
+uv run python -m src.build_vector_db
+```
+
+The pipeline order matters: `ingest` creates `documents.jsonl`, chunking reads that
+file, and the vector database is built only after embedding validation succeeds.
+Rebuilding replaces the `sec_filings` ChromaDB collection; other collections are
+left untouched.
+
+Start the API with:
+```bash
+uv run python -m src.api
 ```
 
 ### Searching the Database
@@ -62,17 +76,17 @@ You can query the system using the `search.py` script:
 
 **Basic Search:**
 ```bash
-python src/search.py "What is the revenue of Apple?"
+uv run python -m src.search "What is the revenue of Apple?"
 ```
 
 **Filtered Search:**
 ```bash
-python src/search.py "What are the risk factors?" --company apple --year 2024 --form 10-K
+uv run python -m src.search "What are the risk factors?" --company apple --year 2024 --form 10-K
 ```
 
 **Adjusting Results:**
 ```bash
-python src/search.py "Net income" --top-k 20
+uv run python -m src.search "Net income" --top-k 20
 ```
 
 ## 📂 Project Structure

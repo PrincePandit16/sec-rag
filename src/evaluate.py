@@ -4,7 +4,7 @@ import os
 import json
 import logging
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Dict
 
 import anthropic
 from ragas import evaluate
@@ -46,7 +46,6 @@ class RAGEvaluator:
         golden_dataset = []
         for doc in sample_docs:
             text = doc.get("text", "")[:5000] # Limit context for generation
-            metadata = doc.get("metadata", {})
             company = doc.get("company", "Unknown")
 
             prompt = (
@@ -63,7 +62,17 @@ class RAGEvaluator:
                     max_tokens=500,
                     messages=[{"role": "user", "content": prompt}],
                 )
-                pair = json.loads(message.content[0].text)
+                response_text = next(
+                    (
+                        block.text
+                        for block in message.content
+                        if block.type == "text"
+                    ),
+                    None,
+                )
+                if response_text is None:
+                    raise ValueError("Anthropic returned no text block.")
+                pair = json.loads(response_text)
                 golden_dataset.append(pair)
             except Exception as e:
                 logger.error(f"Failed to generate pair for {company}: {e}")

@@ -56,6 +56,8 @@ def count_tokens(text: str) -> int:
 
 def decode_tokens(tokens) -> str:
     """Only used with tiktoken; converts token ids back to text."""
+    if _ENCODER is None:
+        raise RuntimeError("Token decoding requires tiktoken.")
     return _ENCODER.decode(tokens)
 
 
@@ -134,6 +136,34 @@ def recursive_split(text: str, max_tokens: int = 400) -> list[str]:
     return [text[:max_tokens * 4]] # Approximation
 
 
+def add_overlap(
+    pieces: list[str],
+    overlap: int,
+    max_tokens: int,
+) -> list[str]:
+    if overlap <= 0 or len(pieces) < 2:
+        return pieces
+
+    overlapped = [pieces[0]]
+    for previous, current in zip(pieces, pieces[1:]):
+        if _ENCODER is not None:
+            prefix_tokens = _ENCODER.encode(previous)[-overlap:]
+            prefix = decode_tokens(prefix_tokens)
+            while prefix_tokens and count_tokens(f"{prefix}\n{current}") > max_tokens:
+                prefix_tokens = prefix_tokens[1:]
+                prefix = decode_tokens(prefix_tokens)
+        else:
+            prefix_words = previous.split()[-overlap:]
+            prefix = " ".join(prefix_words)
+            while prefix_words and count_tokens(f"{prefix} {current}") > max_tokens:
+                prefix_words = prefix_words[1:]
+                prefix = " ".join(prefix_words)
+
+        overlapped.append(f"{prefix}\n{current}" if prefix else current)
+
+    return overlapped
+
+
 def load_documents(input_path: str):
     with open(input_path, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, start=1):
@@ -154,6 +184,13 @@ def make_chunk_id(doc: dict, index: int) -> str:
 
 
 def process(input_path: str, output_path: str, chunk_size: int, overlap: int):
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than zero.")
+    if overlap < 0:
+        raise ValueError("overlap cannot be negative.")
+    if overlap >= chunk_size:
+        raise ValueError("overlap must be smaller than chunk_size.")
+
     total_docs = 0
     total_chunks = 0
 
@@ -184,7 +221,14 @@ def process(input_path: str, output_path: str, chunk_size: int, overlap: int):
                     continue
 
                 # recursive_split replaces the old sliding window chunk_text
-                pieces = recursive_split(text, max_tokens=chunk_size)
+                split_size = chunk_size - overlap
+                if overlap and _ENCODER is not None:
+                    split_size = max(1, split_size - 1)
+                pieces = add_overlap(
+                    recursive_split(text, max_tokens=split_size),
+                    overlap=overlap,
+                    max_tokens=chunk_size,
+                )
                 n = len(pieces)
 
                 for i, piece in enumerate(pieces):
@@ -211,8 +255,8 @@ def process(input_path: str, output_path: str, chunk_size: int, overlap: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Chunk documents.jsonl for embedding.")
-    parser.add_argument("--input", default="documents.jsonl", help="Path to input JSONL")
-    parser.add_argument("--output", default="chunks.jsonl", help="Path to output JSONL")
+    parser.add_argument("--input", default="data/processed/documents.jsonl", help="Path to input JSONL")
+    parser.add_argument("--output", default="data/processed/chunks.jsonl", help="Path to output JSONL")
     parser.add_argument("--chunk-size", type=int, default=400, help="Tokens per chunk")
     parser.add_argument("--overlap", type=int, default=50, help="Token overlap between chunks")
     args = parser.parse_args()

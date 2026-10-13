@@ -1,16 +1,31 @@
-# Python-generated files
+# Byte-compiled / cached files
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+*.py[cod]
+*$py.class
 
-# Virtual environments
-.venv
+# Environments
+.venv/
+env/
+venv/
+ENV/
 
+# Secrets and Local Config
 .env
-data/vector_db/
-data/processed/
-chunks.jsonl
+.env.local
+.env.*.local
+
+# Data and Database (Too large for GitHub)
+data/
+.chroma/
+
+# IDEs
+.vscode/
+.idea/
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+
 CLAUDE.md
+.txt

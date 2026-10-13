@@ -7,20 +7,24 @@ from pathlib import Path
 
 EMBEDDINGS_FILE = Path("data/processed/embeddings.jsonl")
 EXPECTED_DIMENSION = 384
+EXPECTED_MODEL = "BAAI/bge-small-en-v1.5"
 
 
-def validate_embeddings() -> None:
+def validate_embeddings() -> bool:
     if not EMBEDDINGS_FILE.exists():
         print(f"ERROR: File not found: {EMBEDDINGS_FILE}")
-        return
+        return False
 
     total = 0
     missing_embedding = 0
     wrong_dimension = 0
+    wrong_model = 0
     invalid_values = 0
     duplicate_ids = 0
     missing_text = 0
     missing_metadata = 0
+    missing_chunk_id = 0
+    malformed_records = 0
 
     seen_ids = set()
 
@@ -44,6 +48,7 @@ def validate_embeddings() -> None:
             try:
                 record = json.loads(line)
             except json.JSONDecodeError as e:
+                malformed_records += 1
                 print(f"[ERROR] Invalid JSON at line {line_number}: {e}")
                 continue
 
@@ -54,6 +59,7 @@ def validate_embeddings() -> None:
             chunk_id = record.get("chunk_id")
 
             if not chunk_id:
+                missing_chunk_id += 1
                 print(f"[WARNING] Missing chunk_id at line {line_number}")
             elif chunk_id in seen_ids:
                 duplicate_ids += 1
@@ -93,6 +99,9 @@ def validate_embeddings() -> None:
             # ------------------------------------------------
             # Check embedding
             # ------------------------------------------------
+
+            if record.get("embedding_model") != EXPECTED_MODEL:
+                wrong_model += 1
 
             embedding = record.get("embedding")
 
@@ -148,10 +157,13 @@ def validate_embeddings() -> None:
     print(f"Unique chunk IDs:          {len(seen_ids):,}")
     print(f"Missing embeddings:        {missing_embedding:,}")
     print(f"Wrong dimensions:          {wrong_dimension:,}")
+    print(f"Wrong embedding model:     {wrong_model:,}")
     print(f"Invalid embedding values:  {invalid_values:,}")
     print(f"Duplicate chunk IDs:       {duplicate_ids:,}")
     print(f"Missing text:              {missing_text:,}")
     print(f"Missing metadata:          {missing_metadata:,}")
+    print(f"Missing chunk IDs:         {missing_chunk_id:,}")
+    print(f"Malformed records:         {malformed_records:,}")
 
     print()
 
@@ -160,11 +172,13 @@ def validate_embeddings() -> None:
     # --------------------------------------------------------
 
     if (
-        total == 45_089
+        total > 0
         and
         missing_embedding == 0
         and
         wrong_dimension == 0
+        and
+        wrong_model == 0
         and
         invalid_values == 0
         and
@@ -173,17 +187,23 @@ def validate_embeddings() -> None:
         missing_text == 0
         and
         missing_metadata == 0
+        and
+        missing_chunk_id == 0
+        and
+        malformed_records == 0
     ):
         print("STATUS: PASS")
         print()
         print("All embeddings are valid.")
         print("Ready for vector database ingestion.")
+        return True
 
     else:
         print("STATUS: CHECK REQUIRED")
         print()
         print("Some records need investigation.")
+        return False
 
 
 if __name__ == "__main__":
-    validate_embeddings()
+    raise SystemExit(0 if validate_embeddings() else 1)

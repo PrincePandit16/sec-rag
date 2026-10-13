@@ -7,15 +7,47 @@ import hashlib
 import json
 import asyncio
 from datetime import datetime
-from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
-import anthropic
 import chromadb
+from chromadb.api.types import Where
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
+from groq import Groq
 
 from src import config
+
+# ============================================================
+# LLM CLIENT WRAPPER
+# ============================================================
+
+class LLMClient:
+    """Wrapper to handle LLM calls via Groq Cloud API."""
+    def __init__(self, api_key: Optional[str] = None):
+        self.client = Groq(api_key=api_key) if api_key else None
+
+    async def complete(self, prompt: str, system_prompt: str = "", max_tokens: int = 500) -> Optional[str]:
+        if not self.client:
+            return None
+
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
+        try:
+            # Groq's client is synchronous, run in thread to prevent blocking async loop
+            response = await asyncio.to_thread(
+                self.client.chat.completions.create,
+                messages=messages,
+                model=config.LLM_MODEL,
+                max_tokens=max_tokens,
+            )
+            content = response.choices[0].message.content
+            return content.strip() if content else None
+        except Exception as e:
+            print(f"Groq LLM Error: {e}")
+            return None
 
 # ============================================================
 # CACHE HELPERS
@@ -65,9 +97,20 @@ def load_cache(cache_key: str) -> Optional[Dict]:
 def save_cache(cache_key: str, results: List, answer: Optional[str], audit: Optional[str], params: Dict):
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_file = config.CACHE_DIR / f"{cache_key}.json"
+
+    # Ensure results are JSON serializable (convert float32 to float)
+    serializable_results = []
+    for res in results:
+        item = res.copy()
+        if "distance" in item:
+            item["distance"] = float(item["distance"])
+        if "rerank_score" in item:
+            item["rerank_score"] = float(item["rerank_score"])
+        serializable_results.append(item)
+
     cache_data = {
         "metadata": {"params": params, "timestamp": datetime.now().isoformat()},
-        "data": {"final_results": results, "synthesized_answer": answer, "audit_report": audit}
+        "data": {"final_results": serializable_results, "synthesized_answer": answer, "audit_report": audit}
     }
     try:
         with open(cache_file, "w", encoding="utf-8") as f:
@@ -151,10 +194,16 @@ def extract_keywords(query: str) -> List[str]:
 def get_fiscal_year_range(year: int) -> Tuple[str, str]:
     return f"{year}-01-01", f"{year}-12-31"
 
-def build_where_filter(company: Optional[str], year: Optional[int], form: Optional[str]):
+def build_where_filter(
+    company: Optional[str],
+    year: Optional[int],
+    form: Optional[str],
+) -> Where | None:
     conditions = []
-    if company: conditions.append({"company": company})
-    if form: conditions.append({"form": form})
+    if company:
+        conditions.append({"company": company})
+    if form:
+        conditions.append({"form": form})
     if year:
         # To avoid ValueError with $gte on date strings,
         # we use a simple match or filter logic that the DB supports.
@@ -170,7 +219,7 @@ def build_where_filter(company: Optional[str], year: Optional[int], form: Option
 # ASYNC AGENTIC HELPERS (OPTIONAL LLM)
 # ============================================================
 
-async def generate_hypothetical_document(client: Optional[anthropic.AsyncAnthropic], query: str) -> str:
+async def generate_hypothetical_document(client: Optional[LLMClient], query: str) -> str:
     if not client: return query
     prompt = (
         "You are a professional financial analyst. Write a plausible, professional-sounding answer "
@@ -179,18 +228,9 @@ async def generate_hypothetical_document(client: Optional[anthropic.AsyncAnthrop
         f"Query: {query}\n\n"
         "Hypothetical SEC Excerpt:"
     )
-    try:
-        message = await client.messages.create(
-            model=config.LLM_MODEL,
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return message.content[0].text.strip()
-    except Exception as e:
-        print(f"Error generating HyDE: {e}")
-        return query
+    return await client.complete(prompt) or query
 
-async def expand_query(client: Optional[anthropic.AsyncAnthropic], query: str) -> List[str]:
+async def expand_query(client: Optional[LLMClient], query: str) -> List[str]:
     if not client: return [query]
     prompt = (
         "You are a search optimization expert for financial filings. Rewrite the following user query "
@@ -199,19 +239,12 @@ async def expand_query(client: Optional[anthropic.AsyncAnthropic], query: str) -
         f"Query: {query}\n\n"
         "Provide only the rewritten queries, one per line."
     )
-    try:
-        message = await client.messages.create(
-            model=config.LLM_MODEL,
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        expanded = message.content[0].text.strip().split("\n")
-        return [query] + [q.strip() for q in expanded if q.strip()]
-    except Exception as e:
-        print(f"Error expanding query: {e}")
-        return [query]
+    res = await client.complete(prompt, max_tokens=200)
+    if not res: return [query]
+    expanded = res.strip().split("\n")
+    return [query] + [q.strip() for q in expanded if q.strip()]
 
-async def verify_relevance(client: Optional[anthropic.AsyncAnthropic], query: str, results: List[Dict]) -> Tuple[bool, str]:
+async def verify_relevance(client: Optional[LLMClient], query: str, results: List[Dict]) -> Tuple[bool, str]:
     if not client: return True, "No LLM client"
     context_text = "\n\n".join([f"[{i}] {res['document']}" for i, res in enumerate(results, start=1)])
     prompt = (
@@ -222,36 +255,20 @@ async def verify_relevance(client: Optional[anthropic.AsyncAnthropic], query: st
         f"Context:\n{context_text}\n\n"
         "Response (YES/NO and explanation):"
     )
-    try:
-        message = await client.messages.create(
-            model=config.LLM_MODEL,
-            max_tokens=150,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        response = message.content[0].text.strip()
-        return response.upper().startswith("YES"), response
-    except Exception as e:
-        print(f"Error verifying relevance: {e}")
-        return True, ""
+    res = await client.complete(prompt, max_tokens=150)
+    if not res: return True, ""
+    response = res.strip()
+    return response.upper().startswith("YES"), response
 
-async def refine_query(client: Optional[anthropic.AsyncAnthropic], original_query: str, feedback: str) -> str:
+async def refine_query(client: Optional[LLMClient], original_query: str, feedback: str) -> str:
     if not client: return original_query
     prompt = (
         f"The previous search for '{original_query}' failed. The gap was: {feedback}. "
         "Rewrite the query to specifically target the missing information using SEC terminology."
     )
-    try:
-        message = await client.messages.create(
-            model=config.LLM_MODEL,
-            max_tokens=100,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return message.content[0].text.strip()
-    except Exception as e:
-        print(f"Error refining query: {e}")
-        return original_query
+    return await client.complete(prompt, max_tokens=100) or original_query
 
-async def verify_citations(client: Optional[anthropic.AsyncAnthropic], answer: str, results: List[Dict]) -> Tuple[bool, str]:
+async def verify_citations(client: Optional[LLMClient], answer: str, results: List[Dict]) -> Tuple[bool, str]:
     if not client: return True, "No LLM client"
     hallucinations = []
     money_pattern = re.compile(r"\$?\d+(?:\.\d+)?\s*(?:billion|million|thousand|B|M|K)?")
@@ -270,15 +287,7 @@ async def verify_citations(client: Optional[anthropic.AsyncAnthropic], answer: s
         f"Answer:\n{answer}\n\n"
         "Audit Report (List errors or 'VERIFIED'):"
     )
-    try:
-        message = await client.messages.create(
-            model=config.LLM_MODEL,
-            max_tokens=400,
-            messages=[{"role": "user", "content": skeptic_prompt}],
-        )
-        skeptic_report = message.content[0].text.strip()
-    except Exception as e:
-        skeptic_report = f"Skeptic audit failed: {e}"
+    skeptic_report = await client.complete(skeptic_prompt, max_tokens=400) or "Skeptic audit failed"
 
     if not hallucinations and skeptic_report.upper() == "VERIFIED":
         return True, "VERIFIED"
@@ -287,7 +296,7 @@ async def verify_citations(client: Optional[anthropic.AsyncAnthropic], answer: s
     report += "SKEPTIC ANALYSIS:\n" + skeptic_report
     return False, report
 
-async def synthesize_answer_with_feedback(client: Optional[anthropic.AsyncAnthropic], query: str, results: List[Dict], feedback: Optional[str] = None) -> Optional[str]:
+async def synthesize_answer_with_feedback(client: Optional[LLMClient], query: str, results: List[Dict], feedback: Optional[str] = None) -> Optional[str]:
     if not client: return None
     context_text = "\n\n".join([f"[{i}] {res['document']}" for i, res in enumerate(results, start=1)])
     system_prompt = (
@@ -298,19 +307,9 @@ async def synthesize_answer_with_feedback(client: Optional[anthropic.AsyncAnthro
     if feedback:
         user_content += f"IMPORTANT: Correct these audited errors:\n{feedback}\n\n"
     user_content += "Answer:"
-    try:
-        message = await client.messages.create(
-            model=config.LLM_MODEL,
-            max_tokens=500,
-            messages=[{"role": "user", "content": user_content}],
-            system=system_prompt,
-        )
-        return message.content[0].text
-    except Exception as e:
-        print(f"Error during synthesis: {e}")
-        return None
+    return await client.complete(user_content, system_prompt=system_prompt)
 
-async def synthesize_answer(client: Optional[anthropic.AsyncAnthropic], query: str, results: List[Dict]) -> Optional[str]:
+async def synthesize_answer(client: Optional[LLMClient], query: str, results: List[Dict]) -> Optional[str]:
     return await synthesize_answer_with_feedback(client, query, results)
 
 # ============================================================
@@ -321,10 +320,10 @@ async def search(
     collection: chromadb.Collection,
     model: SentenceTransformer,
     reranker: CrossEncoder,
-    client: Optional[anthropic.AsyncAnthropic],
+    client: Optional[LLMClient],
     query: str,
     top_k: int = config.DEFAULT_TOP_K,
-    candidate_k: int = config.DEFAULT_CANDIDATE_K,
+    candidate_k: int = config.DEFAULT_CANDIDATE_HITS,
     companies: Optional[str] = None,
     year: Optional[int] = None,
     form: Optional[str] = None,
@@ -358,7 +357,22 @@ async def search(
         )
 
     results = await asyncio.to_thread(_do_query)
-    documents, metadatas, distances = results["documents"][0], results["metadatas"][0], results["distances"][0]
+    documents_result = results["documents"]
+    metadatas_result = results["metadatas"]
+    distances_result = results["distances"]
+    if (
+        not documents_result
+        or not documents_result[0]
+        or not metadatas_result
+        or not metadatas_result[0]
+        or not distances_result
+        or not distances_result[0]
+    ):
+        return []
+
+    documents = documents_result[0]
+    metadatas = metadatas_result[0]
+    distances = distances_result[0]
 
     vector_ranks = list(range(len(documents)))
     tokenized_corpus = [tokenize(doc) for doc in documents]
@@ -407,10 +421,10 @@ async def run_agentic_search(
     collection: chromadb.Collection,
     model: SentenceTransformer,
     reranker: CrossEncoder,
-    client: Optional[anthropic.AsyncAnthropic],
+    client: Optional[LLMClient],
     query: str,
     top_k: int = config.DEFAULT_TOP_K,
-    candidate_k: int = config.DEFAULT_CANDIDATE_K,
+    candidate_k: int = config.DEFAULT_CANDIDATE_HITS,
     companies: Optional[str] = None,
     year: Optional[int] = None,
     form: Optional[str] = None,
@@ -426,6 +440,11 @@ async def run_agentic_search(
     # Fast Path: if very confident, skip agentic loop
     if first_results and first_results[0]["distance"] < config.CONFIDENCE_THRESHOLD:
         answer = await synthesize_answer(client, query, first_results)
+        if answer is None:
+            report = "Answer synthesis unavailable"
+            save_cache(cache_key, first_results, answer, report, {"query": query})
+            return first_results, answer, report
+
         is_verified, report = await verify_citations(client, answer, first_results)
         save_cache(cache_key, first_results, answer, report if not is_verified else "VERIFIED", {"query": query})
         return first_results, answer, report if not is_verified else "VERIFIED"
@@ -478,6 +497,10 @@ async def run_agentic_search(
             break
         audit_report = report
         synthesized_answer = await synthesize_answer_with_feedback(client, query, final_results, report)
+        if synthesized_answer is None:
+            audit_report = "Answer synthesis unavailable after citation feedback"
+            break
+
         is_verified, report = await verify_citations(client, synthesized_answer, final_results)
         if is_verified:
             audit_report = "VERIFIED"
@@ -516,11 +539,15 @@ async def main():
     model = SentenceTransformer(config.EMBEDDING_MODEL, device="cpu")
     reranker = CrossEncoder(config.RERANKER_MODEL, device="cpu")
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    llm_client = anthropic.AsyncAnthropic(api_key=api_key) if api_key else None
+    api_key = os.environ.get("GROQ_API_KEY")
+    llm_client = LLMClient(api_key=api_key) if api_key else None
 
     results, answer, audit = await run_agentic_search(
-        collection, model, reranker, llm_client, args.query, args.top_k, args.company, args.year, args.form
+        collection, model, reranker, llm_client, args.query,
+        top_k=args.top_k,
+        companies=args.company,
+        year=args.year,
+        form=args.form
     )
 
     print_results(args.query, results, answer)

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import chromadb
+from chromadb.errors import NotFoundError
 
 
 EMBEDDINGS_FILE = Path("data/processed/embeddings.jsonl")
@@ -31,15 +32,6 @@ def build_vector_database() -> None:
     # Persistent local Chroma database
     client = chromadb.PersistentClient(
         path=str(DB_DIR)
-    )
-
-    collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        metadata={
-            "description": "SEC 10-K and 10-Q filing chunks",
-            "embedding_model": "BAAI/bge-small-en-v1.5",
-            "embedding_dimension": 384,
-        },
     )
 
     # --------------------------------------------------------
@@ -71,7 +63,18 @@ def build_vector_database() -> None:
 
             chunk_id = record["chunk_id"]
 
+            if record.get("embedding_model") != "BAAI/bge-small-en-v1.5":
+                raise ValueError(
+                    f"Expected embeddings from BAAI/bge-small-en-v1.5, "
+                    f"got {record.get('embedding_model')!r} for chunk {chunk_id}."
+                )
+
             embedding = record["embedding"]
+            if len(embedding) != 384:
+                raise ValueError(
+                    f"Expected 384-dimensional embeddings, got "
+                    f"{len(embedding)} for chunk {chunk_id}."
+                )
 
             text = record["text"]
 
@@ -94,9 +97,30 @@ def build_vector_database() -> None:
     print(f"Loaded: {total:,} embeddings")
     print()
 
+    if total == 0:
+        raise ValueError(
+            f"No embeddings found in {EMBEDDINGS_FILE}; "
+            "refusing to replace the existing collection."
+        )
+
     # --------------------------------------------------------
-    # Insert into Chroma
+    # Replace the collection so removed or changed filings do not
+    # remain searchable after a rebuild.
     # --------------------------------------------------------
+
+    try:
+        client.delete_collection(name=COLLECTION_NAME)
+    except NotFoundError:
+        pass
+
+    collection = client.create_collection(
+        name=COLLECTION_NAME,
+        metadata={
+            "description": "SEC 10-K and 10-Q filing chunks",
+            "embedding_model": "BAAI/bge-small-en-v1.5",
+            "embedding_dimension": 384,
+        },
+    )
 
     batch_size = 1_000
 

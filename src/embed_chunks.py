@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -21,7 +22,7 @@ OUTPUT_FILE = PROCESSED_DIR / "embeddings.jsonl"
 
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
-DEFAULT_BATCH_SIZE = 32
+DEFAULT_BATCH_SIZE = 8
 
 DEFAULT_DEVICE = "auto"
 
@@ -103,9 +104,13 @@ def load_chunks(
 
 def load_completed_chunk_ids(
     output_path: Path,
+    valid_chunks: dict[str, str],
+    embedding_dimension: int,
+    model_name: str,
 ) -> set[str]:
 
     completed = set()
+    needs_compaction = False
 
     if not output_path.exists():
 
@@ -125,6 +130,7 @@ def load_completed_chunk_ids(
             line = line.strip()
 
             if not line:
+                needs_compaction = True
                 continue
 
             try:
@@ -135,12 +141,58 @@ def load_completed_chunk_ids(
                     "chunk_id"
                 )
 
-                if chunk_id:
+                embedding = record.get("embedding")
+
+                if (
+                    isinstance(chunk_id, str)
+                    and chunk_id in valid_chunks
+                    and record.get("text") == valid_chunks[chunk_id]
+                    and record.get("embedding_model") == model_name
+                    and chunk_id not in completed
+                    and isinstance(embedding, list)
+                    and len(embedding) == embedding_dimension
+                ):
                     completed.add(chunk_id)
+                else:
+                    needs_compaction = True
 
             except json.JSONDecodeError:
-
+                needs_compaction = True
                 continue
+
+    if needs_compaction:
+        print("Removing stale, duplicate, or incompatible embeddings...")
+        temporary_path = output_path.with_name(
+            f"{output_path.name}.tmp"
+        )
+        retained_ids: set[str] = set()
+
+        with (
+            output_path.open("r", encoding="utf-8") as source,
+            temporary_path.open("w", encoding="utf-8") as destination,
+        ):
+            for line in source:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                chunk_id = record.get("chunk_id")
+                embedding = record.get("embedding")
+                if (
+                    isinstance(chunk_id, str)
+                    and chunk_id in valid_chunks
+                    and record.get("text") == valid_chunks[chunk_id]
+                    and record.get("embedding_model") == model_name
+                    and chunk_id not in retained_ids
+                    and isinstance(embedding, list)
+                    and len(embedding) == embedding_dimension
+                ):
+                    destination.write(line)
+                    retained_ids.add(chunk_id)
+
+        os.replace(temporary_path, output_path)
+        completed = retained_ids
 
     print(
         f"Already embedded: "
@@ -158,6 +210,7 @@ def write_embeddings(
     output_file,
     chunks: list[dict],
     embeddings: np.ndarray,
+    model_name: str,
 ) -> None:
 
     for chunk, embedding in zip(
@@ -169,6 +222,8 @@ def write_embeddings(
             "chunk_id": chunk.get(
                 "chunk_id"
             ),
+
+            "embedding_model": model_name,
 
             "company": chunk.get(
                 "company"
@@ -297,8 +352,13 @@ def process(
     # --------------------------------------------------------
 
     embedding_dimension = (
-        model.get_sentence_embedding_dimension()
+        model.get_embedding_dimension()
     )
+
+    if embedding_dimension is None:
+        raise RuntimeError(
+            f"Model {model_name} did not report an embedding dimension."
+        )
 
     print(
         f"Embedding dimension: "
@@ -309,10 +369,18 @@ def process(
     # Find completed chunks
     # --------------------------------------------------------
 
-    completed_ids = (
-        load_completed_chunk_ids(
-            output_path
-        )
+    valid_chunks = {
+        chunk_id: chunk["text"]
+        for chunk in load_chunks(input_path)
+        if isinstance((chunk_id := chunk.get("chunk_id")), str)
+        and chunk_id
+        and isinstance(chunk.get("text"), str)
+    }
+    completed_ids = load_completed_chunk_ids(
+        output_path,
+        valid_chunks,
+        embedding_dimension,
+        model_name,
     )
 
     # --------------------------------------------------------
@@ -389,6 +457,7 @@ def process(
                     model=model,
                     batch=batch,
                     output_file=output_file,
+                    model_name=model_name,
                     completed_ids=completed_ids,
                     batch_number=batch_number,
                     embedded_before=embedded,
@@ -411,6 +480,7 @@ def process(
                 model=model,
                 batch=batch,
                 output_file=output_file,
+                model_name=model_name,
                 completed_ids=completed_ids,
                 batch_number=batch_number,
                 embedded_before=embedded,
@@ -492,6 +562,7 @@ def process_batch(
     model: SentenceTransformer,
     batch: list[dict],
     output_file,
+    model_name: str,
     completed_ids: set[str],
     batch_number: int,
     embedded_before: int,
@@ -544,6 +615,7 @@ def process_batch(
         output_file,
         batch,
         embeddings,
+        model_name,
     )
 
     # --------------------------------------------------------
