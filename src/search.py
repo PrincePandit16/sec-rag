@@ -404,13 +404,19 @@ async def search(
             if any(exp in doc_lower for exp in ["operating expenses", "provision for income taxes", "r&d"]):
                 score -= 0.5
 
-        candidates.append({"document": doc, "metadata": meta, "distance": dist, "score": score, "matched_keywords": matched})
+        candidates.append({
+            "document": doc,
+            "metadata": meta,
+            "distance": float(dist),
+            "score": float(score),
+            "matched_keywords": matched,
+        })
 
     if reranker:
         pairs = [[query, c["document"]] for c in candidates]
         rerank_scores = reranker.predict(pairs)
         for i, s in enumerate(rerank_scores):
-            candidates[i]["rerank_score"] = s
+            candidates[i]["rerank_score"] = float(s)
     else:
         for c in candidates: c["rerank_score"] = c["score"]
 

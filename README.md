@@ -46,6 +46,8 @@ optional and is used only to summarize tables during filing ingestion.
 ```bash
 export GROQ_API_KEY='your-groq-api-key-here'
 export ANTHROPIC_API_KEY='your-anthropic-api-key-here'
+# Optional; defaults to a currently supported Groq model.
+export LLM_MODEL='openai/gpt-oss-120b'
 ```
 
 ## 💻 Usage

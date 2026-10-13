@@ -20,8 +20,8 @@ COLLECTION_NAME = "sec_filings"
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-# Default to a strong HF model for synthesis
-LLM_MODEL = os.environ.get("LLM_MODEL", "HuggingFaceH4/zephyr-7b-beta")
+# Groq-hosted model for synthesis and query refinement.
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
 
 # ============================================================
 # HYPERPARAMETERS
