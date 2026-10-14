@@ -2,6 +2,8 @@ import os
 import time
 import requests
 
+from src import config
+
 
 # ============================================================
 # CONFIGURATION
@@ -9,7 +11,7 @@ import requests
 
 USER_AGENT = "SEC-RAG-Project larixo6289@kingdais.com"
 
-OUTPUT_DIR = "data/raw"
+OUTPUT_DIR = str(config.RAW_DIR)
 
 # Companies we want to collect
 COMPANIES = {

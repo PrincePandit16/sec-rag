@@ -16,7 +16,7 @@ A Retrieval-Augmented Generation (RAG) system designed to process unstructured S
 ## 🛠️ Architecture
 
 The system follows a standard RAG pipeline:
-1. **Download**: Fetches raw `.htm` filings from the SEC $\rightarrow$ `data/raw/`
+1. **Download**: Fetches raw `.htm` filings from the SEC $\rightarrow$ `data/raw_backup/`
 2. **Chunking**: Splits documents into manageable segments for better retrieval $\rightarrow$ `data/processed/`
 3. **Embedding**: Generates high-dimensional vectors using Sentence-Transformers.
 4. **Ingestion**: Populates a persistent ChromaDB vector store $\rightarrow$ `data/vector_db/`
@@ -53,7 +53,18 @@ export LLM_MODEL='openai/gpt-oss-120b'
 ## 💻 Usage
 
 ### Running the Pipeline
-To build the database from scratch:
+The SEC filing files are required input and are not included in a GitHub clone.
+Before building or using the search database, populate `data/raw_backup/` with
+the raw SEC `.htm` filings. You can either download the configured filings from
+the SEC with the first command below or place your own filings there. Keep the
+company subdirectories and filename format used by the downloader, for example:
+
+```text
+data/raw_backup/apple/2024-11-01_10-K_aapl-20240928.htm
+```
+
+Then run the pipeline in order to ingest those filings, chunk the extracted
+text, generate and validate embeddings, and build the local vector database:
 ```bash
 uv run python -m src.download_filings
 uv run python -m src.ingest
@@ -67,6 +78,11 @@ The pipeline order matters: `ingest` creates `documents.jsonl`, chunking reads t
 file, and the vector database is built only after embedding validation succeeds.
 Rebuilding replaces the `sec_filings` ChromaDB collection; other collections are
 left untouched.
+
+Search combines vector results with BM25 retrieval over the full filing collection,
+then reranks the combined candidates while retaining exact financial-table evidence.
+Queries that specify a fiscal year and annual report are narrowed to the matching
+10-K period when that filing is available.
 
 Start the API with:
 ```bash
@@ -96,7 +112,7 @@ uv run python -m src.search "Net income" --top-k 20
 ```text
 sec-rag/
 ├── data/
-│   ├── raw/            # Original SEC .htm filings
+│   ├── raw_backup/     # Required original SEC .htm filings (not included in Git)
 │   ├── processed/      # Intermediate JSONL chunks & embeddings
 │   └── vector_db/      # ChromaDB persistent storage
 ├── src/

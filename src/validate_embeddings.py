@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 EMBEDDINGS_FILE = Path("data/processed/embeddings.jsonl")
+CHUNKS_FILE = Path("data/processed/chunks.jsonl")
 EXPECTED_DIMENSION = 384
 EXPECTED_MODEL = "BAAI/bge-small-en-v1.5"
 
@@ -14,6 +15,35 @@ def validate_embeddings() -> bool:
     if not EMBEDDINGS_FILE.exists():
         print(f"ERROR: File not found: {EMBEDDINGS_FILE}")
         return False
+
+    if not CHUNKS_FILE.exists():
+        print(f"ERROR: File not found: {CHUNKS_FILE}")
+        return False
+
+    expected_chunks = {}
+    duplicate_chunk_ids = 0
+    malformed_chunks = 0
+    with CHUNKS_FILE.open("r", encoding="utf-8") as f:
+        for line_number, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError as e:
+                malformed_chunks += 1
+                print(f"[ERROR] Invalid chunk JSON at line {line_number}: {e}")
+                continue
+
+            chunk_id = chunk.get("chunk_id")
+            text = chunk.get("text")
+            if not isinstance(chunk_id, str) or not chunk_id or not isinstance(text, str):
+                malformed_chunks += 1
+                print(f"[ERROR] Missing chunk ID or text at line {line_number}")
+                continue
+            if chunk_id in expected_chunks:
+                duplicate_chunk_ids += 1
+            expected_chunks[chunk_id] = text
 
     total = 0
     missing_embedding = 0
@@ -25,6 +55,7 @@ def validate_embeddings() -> bool:
     missing_metadata = 0
     missing_chunk_id = 0
     malformed_records = 0
+    embedding_text_mismatches = 0
 
     seen_ids = set()
 
@@ -66,6 +97,11 @@ def validate_embeddings() -> bool:
                 print(f"[WARNING] Duplicate chunk_id: {chunk_id}")
             else:
                 seen_ids.add(chunk_id)
+                if chunk_id not in expected_chunks:
+                    print(f"[ERROR] Embedding has no matching input chunk: {chunk_id}")
+                elif record.get("text") != expected_chunks[chunk_id]:
+                    embedding_text_mismatches += 1
+                    print(f"[ERROR] Text does not match input chunk: {chunk_id}")
 
             # ------------------------------------------------
             # Check text
@@ -154,6 +190,11 @@ def validate_embeddings() -> bool:
     print("=" * 65)
 
     print(f"Total records:             {total:,}")
+    print(f"Input chunks:              {len(expected_chunks):,}")
+    print(f"Duplicate input chunk IDs: {duplicate_chunk_ids:,}")
+    print(f"Malformed input chunks:    {malformed_chunks:,}")
+    print(f"Missing chunk embeddings:  {len(set(expected_chunks) - seen_ids):,}")
+    print(f"Embedding text mismatches: {embedding_text_mismatches:,}")
     print(f"Unique chunk IDs:          {len(seen_ids):,}")
     print(f"Missing embeddings:        {missing_embedding:,}")
     print(f"Wrong dimensions:          {wrong_dimension:,}")
@@ -191,6 +232,14 @@ def validate_embeddings() -> bool:
         missing_chunk_id == 0
         and
         malformed_records == 0
+        and
+        duplicate_chunk_ids == 0
+        and
+        malformed_chunks == 0
+        and
+        seen_ids == set(expected_chunks)
+        and
+        embedding_text_mismatches == 0
     ):
         print("STATUS: PASS")
         print()

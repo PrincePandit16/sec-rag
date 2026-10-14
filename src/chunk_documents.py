@@ -211,8 +211,9 @@ def process(input_path: str, output_path: str, chunk_size: int, overlap: int):
             date = doc.get("filing_date", "UNKDATE")
             form = doc.get("form", "UNKFORM")
             document_id = doc.get("document", "UNKDOC")
+            document_chunk_index = 0
 
-            for s_idx, section in enumerate(sections):
+            for section in sections:
                 section_name = section.get("section_name", "General")
                 raw_text = section.get("text", "")
 
@@ -229,25 +230,24 @@ def process(input_path: str, output_path: str, chunk_size: int, overlap: int):
                     overlap=overlap,
                     max_tokens=chunk_size,
                 )
-                n = len(pieces)
-
-                for i, piece in enumerate(pieces):
+                for piece in pieces:
                     # Metadata Breadcrumb
                     breadcrumb = f"{company} | {date} | {form} | {section_name}"
                     chunk_text = f"{breadcrumb}\n\n{piece}"
 
                     record = {
-                        "chunk_id": make_chunk_id(doc, (s_idx * n) + i),
+                        "chunk_id": make_chunk_id(doc, document_chunk_index),
                         "company": company,
                         "filing_date": date,
                         "form": form,
                         "document": document_id,
-                        "chunk_index": (s_idx * n) + i,
+                        "chunk_index": document_chunk_index,
                         "total_chunks": -1, # Recalculated later or left as total
                         "text": chunk_text,
                     }
                     out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
                     total_chunks += 1
+                    document_chunk_index += 1
 
     print(f"Processed {total_docs} documents -> {total_chunks} chunks")
     print(f"Wrote output to {output_path}")

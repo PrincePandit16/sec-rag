@@ -19,24 +19,23 @@ def fix_mojibake(text: str) -> str:
     return text.strip()
 
 def normalize_whitespace(text: str) -> str:
-
     """Collapses multiple spaces and newlines into a single space or newline."""
     if not text:
         return ""
-    # Replace multiple spaces with one
     text = re.sub(r"[ \t]+", " ", text)
-    # Replace multiple newlines with two (keep paragraph separation)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 def remove_boilerplate(text: str) -> str:
     """Removes common SEC filing boilerplate patterns."""
-    # These patterns are derived from existing chunk_documents.py logic
     _BOILERPLATE_PATTERNS = [
         r"Page \d+ of \d+",
         r"\(Continued on next page\)",
         r"See accompanying notes to consolidated financial statements",
         r"All amounts in millions, unless otherwise noted",
+        r"All amounts in millions, unless otherwise and noted",
+        r"Amounts in millions, unless otherwise noted",
+        r"Total net sales",
     ]
 
     cleaned = text
@@ -47,8 +46,19 @@ def remove_boilerplate(text: str) -> str:
 
 def clean_html_artifacts(text: str) -> str:
     """Removes leftover HTML entities or glyphs."""
-    # Replace common replacement characters
     text = text.replace("�", "")
-    # Remove any remaining angle-bracketed noise that looks like tags
     text = re.sub(r"<[^>]+>", "", text)
     return text.strip()
+
+def unified_clean(text: str) -> str:
+    """
+    The master cleaning pipeline for all SEC text processing.
+    Applies: Mojibake fix -> Boilerplate removal -> HTML clean -> Whitespace normalization.
+    """
+    if not text:
+        return ""
+    text = fix_mojibake(text)
+    text = remove_boilerplate(text)
+    text = clean_html_artifacts(text)
+    text = normalize_whitespace(text)
+    return text

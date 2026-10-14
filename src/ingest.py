@@ -12,20 +12,19 @@ import anthropic
 import ftfy
 from charset_normalizer import from_path
 
-if __package__ in {None, ""}:
-    from utils.text_cleaning import normalize_whitespace
-else:
-    from .utils.text_cleaning import normalize_whitespace
+from src import config
+from src.utils.text_cleaning import normalize_whitespace, unified_clean
+from src.utils.logging_config import logger
+from src.utils.io import safe_write_jsonl
 
 
 # ============================================================
 # Configuration
 # ============================================================
 
-RAW_DIR = Path("data/raw")
-PROCESSED_DIR = Path("data/processed")
-
-OUTPUT_FILE = PROCESSED_DIR / "documents.jsonl"
+RAW_DIR = config.RAW_DIR
+PROCESSED_DIR = config.PROCESSED_DIR
+OUTPUT_FILE = config.DOCUMENTS_JSONL
 
 
 # ============================================================
@@ -60,7 +59,7 @@ def extract_metadata(filepath: Path) -> dict:
 
     Example:
 
-        data/raw/apple/
+        data/raw_backup/apple/
         2024-11-01_10-K_aapl-20240928.htm
 
     Produces:
@@ -198,113 +197,43 @@ def summarize_table(md_table: str) -> str:
         return f"Error generating summary: {e}"
 
 def html_to_text(filepath: Path) -> str:
-
     """
     Convert an SEC filing HTML document into clean text.
-
-    Removes:
-    - XBRL metadata
-    - scripts
-    - styles
-    - SVGs
-    - other obvious HTML noise
-
-    Returns:
-        Clean human-readable text.
     """
-
-    # --------------------------------------------------------
-    # Robust File Reading & Cleaning
-    # --------------------------------------------------------
     try:
-        # Detect encoding and decode
         result = from_path(filepath)
         html = str(result.best())
-        # Fix mojibake and normalize unicode
         html = ftfy.fix_text(html)
-        from src.utils.text_cleaning import fix_mojibake
-        html = fix_mojibake(html)
     except Exception as e:
-
-        print(f"[WARNING] Encoding error in {filepath}: {e}")
+        logger.warning(f"Encoding error in {filepath}: {e}")
         html = filepath.read_text(encoding="utf-8", errors="ignore")
 
-    soup = BeautifulSoup(
-        html,
-        "lxml",
-    )
+    soup = BeautifulSoup(html, "lxml")
 
-    # --------------------------------------------------------
     # Remove XBRL / Inline XBRL metadata
-    # --------------------------------------------------------
-
-    for tag in soup.find_all(
-        [
-            "ix:header",
-            "ix:hidden",
-            "ix:resources",
-        ]
-    ):
+    for tag in soup.find_all(["ix:header", "ix:hidden", "ix:resources"]):
         tag.decompose()
 
-    # Remove XBRL namespace elements
     for tag in soup.find_all():
-
         name = tag.name.lower()
-
-        if (
-            name.startswith("ix:")
-            or name.startswith("xbrli:")
-            or name.startswith("xbrldi:")
-        ):
+        if name.startswith("ix:") or name.startswith("xbrli:") or name.startswith("xbrldi:"):
             tag.decompose()
 
-    # --------------------------------------------------------
     # Remove standard HTML noise
-    # --------------------------------------------------------
-
-    for element in soup(
-        [
-            "script",
-            "style",
-            "noscript",
-            "svg",
-        ]
-    ):
+    for element in soup(["script", "style", "noscript", "svg"]):
         element.decompose()
 
-    # --------------------------------------------------------
     # Convert Tables to Markdown with Summaries
-    # --------------------------------------------------------
-
     for table in soup.find_all("table"):
         markdown_table = table_to_markdown(table)
-
-        # Only summarize tables of a reasonable size
         summary = ""
         if 500 < len(markdown_table) < 15000:
             summary = summarize_table(markdown_table)
             summary = f"\nTable Summary: {summary}\n"
-
-        # Replace table with its summary and markdown representation
         table.replace_with(f"\n{summary}{markdown_table}\n")
 
-    # --------------------------------------------------------
-    # Extract visible text
-    # --------------------------------------------------------
-
-    text = soup.get_text(
-        separator="\n",
-        strip=True,
-    )
-
-    # --------------------------------------------------------
-    # Normalize whitespace
-    # --------------------------------------------------------
-
-    text = normalize_whitespace(text)
-
-    return text
+    text = soup.get_text(separator="\n", strip=True)
+    return unified_clean(text)
 
 
 # ============================================================
@@ -375,11 +304,7 @@ def process_document(filepath: Path) -> dict | None:
         return document
 
     except Exception as error:
-
-        print(
-            f"[ERROR] {filepath}: {error}"
-        )
-
+        logger.error(f"Error processing {filepath}: {error}")
         return None
 
 

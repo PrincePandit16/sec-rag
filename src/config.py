@@ -9,6 +9,11 @@ load_dotenv()
 # PATHS
 # ============================================================
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+RAW_DIR = PROJECT_ROOT / "data" / "raw_backup"
+PROCESSED_DIR = PROJECT_ROOT / "data/processed"
+DOCUMENTS_JSONL = PROCESSED_DIR / "documents.jsonl"
+CHUNKS_JSONL = PROCESSED_DIR / "chunks.jsonl"
+
 CHROMA_DIR = PROJECT_ROOT / "data/vector_db"
 CACHE_DIR = PROJECT_ROOT / "data/cache/search"
 EMBEDDING_CACHE_FILE = PROJECT_ROOT / "data/cache/embedding_cache.json"

@@ -6,6 +6,7 @@ import re
 import hashlib
 import json
 import asyncio
+import sqlite3
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -15,8 +16,12 @@ from chromadb.api.types import Where
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
 from groq import Groq
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from src import config
+from src.utils.financial_normalization import FinancialNormalizer
+from src.utils.logging_config import logger
+from src.utils.types import SearchResult, DocumentMetadata
 
 SEARCH_CACHE_VERSION = 2
 _LEXICAL_INDEX_CACHE: dict[
@@ -33,6 +38,10 @@ class LLMClient:
     def __init__(self, api_key: Optional[str] = None):
         self.client = Groq(api_key=api_key) if api_key else None
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10)
+    )
     async def complete(self, prompt: str, system_prompt: str = "", max_tokens: int = 500) -> Optional[str]:
         if not self.client:
             return None
@@ -53,12 +62,47 @@ class LLMClient:
             content = response.choices[0].message.content
             return content.strip() if content else None
         except Exception as e:
-            print(f"Groq LLM Error: {e}")
+            logger.error(f"Groq LLM Error: {e}")
             return None
 
 # ============================================================
 # CACHE HELPERS
 # ============================================================
+
+class EmbeddingCache:
+    """
+    SQLite-backed cache for embeddings to avoid expensive re-computation
+    and eliminate the JSON I/O bottleneck.
+    """
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS embeddings "
+                "(hash TEXT PRIMARY KEY, embedding TEXT)"
+            )
+
+    def get(self, text_hash: str) -> Optional[List[float]]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT embedding FROM embeddings WHERE hash = ?", (text_hash,))
+            row = cursor.fetchone()
+            if row:
+                return json.loads(row[0])
+        return None
+
+    def set(self, text_hash: str, embedding: List[float]):
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO embeddings (hash, embedding) VALUES (?, ?)",
+                (text_hash, json.dumps(embedding))
+            )
+
+# Initialize global cache
+_EMBEDDING_CACHE = EmbeddingCache(config.PROJECT_ROOT / "data/cache/embeddings.db")
 
 def tokenize(text: str) -> List[str]:
     """Tokenizes text for BM25, preserving financial terms like 10-K."""
@@ -99,7 +143,7 @@ def load_cache(cache_key: str) -> Optional[Dict]:
             with open(cache_file, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"Error loading cache: {e}")
+            logger.error(f"Error loading cache: {e}")
     return None
 
 def save_cache(cache_key: str, results: List, answer: Optional[str], audit: Optional[str], params: Dict):
@@ -124,7 +168,7 @@ def save_cache(cache_key: str, results: List, answer: Optional[str], audit: Opti
         with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(cache_data, f, indent=2)
     except Exception as e:
-        print(f"Error saving cache: {e}")
+        logger.error(f"Error saving cache: {e}")
 
 def get_embedding_cached(text: str, model) -> List[float]:
     norm_text = text.strip()
@@ -132,25 +176,12 @@ def get_embedding_cached(text: str, model) -> List[float]:
         return model.encode("", normalize_embeddings=True).tolist()
     text_hash = hashlib.sha256(norm_text.encode("utf-8")).hexdigest()
 
-    cache = {}
-    if config.EMBEDDING_CACHE_FILE.exists():
-        try:
-            with open(config.EMBEDDING_CACHE_FILE, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-        except Exception as e:
-            print(f"Warning: Could not load embedding cache: {e}")
-
-    if text_hash in cache:
-        return cache[text_hash]
+    cached_embedding = _EMBEDDING_CACHE.get(text_hash)
+    if cached_embedding:
+        return cached_embedding
 
     embedding = model.encode(norm_text, normalize_embeddings=True).tolist()
-    cache[text_hash] = embedding
-    config.EMBEDDING_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with open(config.EMBEDDING_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f)
-    except Exception as e:
-        print(f"Warning: Could not save embedding cache: {e}")
+    _EMBEDDING_CACHE.set(text_hash, embedding)
     return embedding
 
 # ============================================================
@@ -393,19 +424,79 @@ async def refine_query(client: Optional[LLMClient], original_query: str, feedbac
     return await client.complete(prompt, max_tokens=100) or original_query
 
 async def verify_citations(client: Optional[LLMClient], answer: str, results: List[Dict]) -> Tuple[bool, str]:
-    if not client: return True, "No LLM client"
     hallucinations = []
-    money_pattern = re.compile(r"\$?\d+(?:\.\d+)?\s*(?:billion|million|thousand|B|M|K)?")
-    date_pattern = re.compile(r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b")
-    found_values = money_pattern.findall(answer) + date_pattern.findall(answer)
+    citation_pattern = re.compile(
+        r"(?P<value>(?:\$\s*)?\d+(?:,\d{3})*(?:\.\d+)?"
+        r"(?:\s*(?:billion|million|thousand|[BMK])\b)?"
+        r"|\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b)"
+        r"\s*\[(?P<index>\d+)\]",
+        re.IGNORECASE,
+    )
+    invalid_indices = set()
+    for match in re.finditer(r"\[(\d+)\]", answer):
+        idx = int(match.group(1)) - 1
+        if idx < 0 or idx >= len(results):
+            if idx not in invalid_indices:
+                hallucinations.append(f"Citation index [{idx + 1}] is out of range.")
+                invalid_indices.add(idx)
 
-    for val in found_values:
-        if not any(val in res["document"] for res in results):
-            hallucinations.append(f"Value '{val}' not found in any cited source.")
+    for match in citation_pattern.finditer(answer):
+        value = match.group("value")
+        idx = int(match.group("index")) - 1
+        if idx < 0 or idx >= len(results):
+            continue
 
+        # Index-Aware Verification: Check only the cited chunk
+        source_text = results[idx]["document"]
+        if not FinancialNormalizer.is_equivalent(value, source_text):
+            # The above is_equivalent might fail if source_text is a whole document.
+            # We need to check if the value exists within that document.
+            found_in_chunk = False
+            # Extract all values from the cited chunk for a fair comparison
+            chunk_values = FinancialNormalizer.extract_values(source_text)
+            norm_value = FinancialNormalizer.normalize(value)
+
+            if norm_value is not None:
+                for v_norm, v_orig in chunk_values:
+                    if abs(v_norm - norm_value) < 1e-2:
+                        found_in_chunk = True
+                        break
+            else:
+                # Fallback for non-financial values (dates, etc.)
+                if value.lower() in source_text.lower():
+                    found_in_chunk = True
+
+            if not found_in_chunk:
+                # Drift Detection: Scan other chunks to see if it was just mis-cited
+                found_in = []
+                for i, result in enumerate(results):
+                    res_text = result["document"]
+                    res_values = FinancialNormalizer.extract_values(res_text)
+                    if norm_value is not None:
+                        if any(abs(v_norm - norm_value) < 1e-2 for v_norm, v_orig in res_values):
+                            found_in.append(i + 1)
+                    elif value.lower() in res_text.lower():
+                        found_in.append(i + 1)
+
+                if found_in:
+                    hallucinations.append(
+                        f"Value '{value}' cited as [{idx + 1}] but found in {found_in}."
+                    )
+                else:
+                    hallucinations.append(
+                        f"Value '{value}' cited as [{idx + 1}] not found in any source."
+                    )
+
+    if not client:
+        if hallucinations:
+            return False, "INDEX ERRORS:\n" + "\n".join(hallucinations)
+        return True, "No LLM client"
+
+    # 2. LLM Skeptic Audit for Period Mismatches & Nuance
     context_text = "\n\n".join([f"[{i}] {res['document']}" for i, res in enumerate(results, start=1)])
     skeptic_prompt = (
-        "You are an adversarial financial auditor. Find any factual contradiction or hallucination "
+        "You are an adversarial financial auditor. Find any factual contradiction, "
+        "hallucination, or fiscal period mismatch (e.g., citing 2023 data for a 2024 query) "
         "in the answer compared to the sources. Be pedantic.\n\n"
         f"Context:\n{context_text}\n\n"
         f"Answer:\n{answer}\n\n"
@@ -416,7 +507,7 @@ async def verify_citations(client: Optional[LLMClient], answer: str, results: Li
     if not hallucinations and skeptic_report.upper() == "VERIFIED":
         return True, "VERIFIED"
 
-    report = ("EXACT MATCH ERRORS:\n" + "\n".join(hallucinations) + "\n\n") if hallucinations else ""
+    report = ("INDEX ERRORS:\n" + "\n".join(hallucinations) + "\n\n") if hallucinations else ""
     report += "SKEPTIC ANALYSIS:\n" + skeptic_report
     return False, report
 
@@ -739,10 +830,10 @@ def print_results(query: str, results: List[Dict], synthesized_answer: Optional[
     for idx, (source_meta, chunk_indices) in enumerate(unique_sources.items(), 1):
         company, form, date = source_meta
         indices_str = ", ".join(map(str, chunk_indices))
-        print(f"\nSource #{idx} [{indices_str}]: {company} {form} filed {date}")
+        logger.info(f"Source #{idx} [{indices_str}]: {company} {form} filed {date}")
         # Optionally show the first chunk's text as a snippet
         first_res = results[chunk_indices[0]-1]
-        print(f"Text snippet: {first_res['document'][:200]}...")
+        logger.info(f"Text snippet: {first_res['document'][:200]}...")
 
 async def main():
     parser = argparse.ArgumentParser()
@@ -753,7 +844,7 @@ async def main():
     parser.add_argument("--top-k", type=int, default=config.DEFAULT_TOP_K)
     args = parser.parse_args()
 
-    print("Loading models...")
+    logger.info("Loading models...")
     client = chromadb.PersistentClient(path=str(config.CHROMA_DIR))
     collection = client.get_collection(config.COLLECTION_NAME)
     model = SentenceTransformer(config.EMBEDDING_MODEL, device="cpu")
@@ -771,7 +862,8 @@ async def main():
     )
 
     print_results(args.query, results, answer)
-    if audit: print(f"\n{'!'*80}\nAUDIT: {audit}\n{'!'*80}")
+    if audit:
+        print(f"\n{'!'*80}\nAUDIT: {audit}\n{'!'*80}")
 
 if __name__ == "__main__":
     asyncio.run(main())
