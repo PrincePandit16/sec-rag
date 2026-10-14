@@ -222,7 +222,10 @@ def html_to_text(filepath: Path) -> str:
         html = str(result.best())
         # Fix mojibake and normalize unicode
         html = ftfy.fix_text(html)
+        from src.utils.text_cleaning import fix_mojibake
+        html = fix_mojibake(html)
     except Exception as e:
+
         print(f"[WARNING] Encoding error in {filepath}: {e}")
         html = filepath.read_text(encoding="utf-8", errors="ignore")
 

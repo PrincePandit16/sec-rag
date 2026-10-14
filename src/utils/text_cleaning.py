@@ -1,6 +1,25 @@
 import re
 
+def fix_mojibake(text: str) -> str:
+    """
+    Fixes encoding artifacts (mojibake) and common SEC filing glitches.
+    Uses ftfy to handle UTF-8/Latin-1 mismatches.
+    """
+    import ftfy
+    if not text:
+        return ""
+
+    # Fixes common mojibake (e.g., âs -> 's)
+    text = ftfy.fix_text(text)
+
+    # Handle remaining SEC-specific artifacts that ftfy might miss
+    # â¯ and ã are common artifacts in SEC filings when viewed/processed incorrectly
+    text = text.replace("â¯", " ").replace("ã", "")
+
+    return text.strip()
+
 def normalize_whitespace(text: str) -> str:
+
     """Collapses multiple spaces and newlines into a single space or newline."""
     if not text:
         return ""

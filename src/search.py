@@ -10,12 +10,19 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 import chromadb
+import ftfy
 from chromadb.api.types import Where
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
 from groq import Groq
 
 from src import config
+
+SEARCH_CACHE_VERSION = 2
+_LEXICAL_INDEX_CACHE: dict[
+    tuple[str, int],
+    tuple[list[str], list[str], list[Any], list[list[str]], BM25Okapi],
+] = {}
 
 # ============================================================
 # LLM CLIENT WRAPPER
@@ -79,7 +86,8 @@ def generate_cache_key(query: str, top_k: int, candidate_k: int, companies: Any,
         "companies": sorted(companies) if isinstance(companies, list) else [companies] if companies else [],
         "year": year,
         "form": form,
-        "db_version": db_version
+        "db_version": db_version,
+        "search_version": SEARCH_CACHE_VERSION,
     }
     param_string = json.dumps(normalized_params, sort_keys=True)
     return hashlib.sha256(param_string.encode("utf-8")).hexdigest()
@@ -171,6 +179,8 @@ def detect_form(query: str) -> Optional[str]:
     query_lower = query.lower()
     if "10-k" in query_lower: return "10-K"
     if "10-q" in query_lower: return "10-Q"
+    if re.search(r"\b(?:fiscal year|annual report|annual filing|year ended)\b", query_lower):
+        return "10-K"
     return None
 
 def extract_keywords(query: str) -> List[str]:
@@ -193,6 +203,120 @@ def extract_keywords(query: str) -> List[str]:
 
 def get_fiscal_year_range(year: int) -> Tuple[str, str]:
     return f"{year}-01-01", f"{year}-12-31"
+
+
+def get_lexical_index(
+    collection: chromadb.Collection,
+) -> tuple[list[str], list[str], list[Any], list[list[str]], BM25Okapi]:
+    collection_id = str(getattr(collection, "id", id(collection)))
+    collection_count = collection.count()
+    cache_key = (collection_id, collection_count)
+    cached = _LEXICAL_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    indexed = collection.get(include=["documents", "metadatas"])
+    ids = indexed["ids"]
+    documents = indexed["documents"] or []
+    metadatas = indexed["metadatas"] or [{} for _ in documents]
+    if not documents:
+        raise ValueError("The SEC filings collection contains no searchable documents.")
+
+    tokenized_documents = [tokenize(document) for document in documents]
+    index = (
+        ids,
+        documents,
+        metadatas,
+        tokenized_documents,
+        BM25Okapi(tokenized_documents),
+    )
+    for old_key in [key for key in _LEXICAL_INDEX_CACHE if key[0] == collection_id]:
+        del _LEXICAL_INDEX_CACHE[old_key]
+    _LEXICAL_INDEX_CACHE[cache_key] = index
+    return index
+
+
+def get_period_year(metadata: dict) -> Optional[int]:
+    document_id = str(metadata.get("document", ""))
+    match = re.search(r"\b(20\d{2})\d{4}\b", document_id)
+    return int(match.group(1)) if match else None
+
+
+def expand_financial_query(query: str) -> str:
+    query_lower = query.lower()
+    expansions = {
+        "revenue": ("revenue", "net sales", "total net sales", "total revenue", "sales"),
+        "profit": ("profit", "net income", "earnings"),
+        "cash": (
+            "cash flow",
+            "cash flows",
+            "cash from operations",
+            "net cash from operations",
+            "operating activities",
+        ),
+        "risk": ("risk factors", "Item 1A", "risks and uncertainties"),
+    }
+    terms = [query]
+    for trigger, synonyms in expansions.items():
+        if trigger in query_lower or (
+            trigger == "revenue" and "sales" in query_lower
+        ):
+            terms.extend(synonyms)
+    return " ".join(dict.fromkeys(terms))
+
+
+def financial_evidence_bonus(
+    query: str,
+    document: str,
+    metadata: dict,
+    year: Optional[int],
+) -> float:
+    text = document.lower()
+    query_lower = query.lower()
+    bonus = 0.0
+    has_numbers = re.search(r"\d", text) is not None
+
+    if has_numbers and any(term in query_lower for term in ("revenue", "sales")):
+        table_revenue_row = re.search(
+            r"\b(?:total net sales|total revenue|net sales)\b"
+            r"(?:\s*\|\s*(?:total net sales|total revenue|net sales)){0,2}"
+            r"\s*\|\s*\$\s*\|\s*[\d,]+",
+            text,
+        )
+        revenue_with_amount = re.search(
+            r"\b(?:revenue|net sales)\b.{0,100}?\$\s*[\d,.]+",
+            text,
+            flags=re.DOTALL,
+        )
+        if table_revenue_row:
+            bonus += 0.30
+        elif revenue_with_amount:
+            bonus += 0.12
+
+    if (
+        has_numbers
+        and re.search(r"\b(?:cash from operations|net cash from operations|cash flows?)\b", text)
+        and "cash" in query_lower
+    ):
+        bonus += 0.10
+        if re.search(
+            r"\b(?:cash from operations|net cash from operations)\b"
+            r".{0,100}?\$\s*[\d,.]+",
+            text,
+            flags=re.DOTALL,
+        ):
+            bonus += 0.20
+
+    if (
+        re.search(r"\b(?:risk factors|item 1a)\b", text)
+        and any(term in query_lower for term in ("risk", "risks"))
+    ):
+        bonus += 0.08
+
+    if year is not None and get_period_year(metadata) == year:
+        bonus += 0.12
+
+    return bonus
 
 def build_where_filter(
     company: Optional[str],
@@ -298,16 +422,38 @@ async def verify_citations(client: Optional[LLMClient], answer: str, results: Li
 
 async def synthesize_answer_with_feedback(client: Optional[LLMClient], query: str, results: List[Dict], feedback: Optional[str] = None) -> Optional[str]:
     if not client: return None
-    context_text = "\n\n".join([f"[{i}] {res['document']}" for i, res in enumerate(results, start=1)])
+    context_text = "\n\n".join(
+        f"[{i}] {res['metadata'].get('company')} "
+        f"{res['metadata'].get('form')} filed {res['metadata'].get('filing_date')}\n"
+        f"{res['document']}"
+        for i, res in enumerate(results, start=1)
+    )
     system_prompt = (
-        "You are a professional financial analyst. Answer the query based ONLY on the provided excerpts. "
-        "Every factual claim MUST have a citation [number]. If not present, state you lack information."
+        "You are a careful financial analyst. Answer only from the supplied SEC filing excerpts. "
+        "Answer the question directly and cite every factual claim with its source number. "
+        "The only valid citation format is the bracketed source number shown before an excerpt, "
+        "for example [1] or [2]. Never invent page, line, or range citations such as L1-L4. "
+        "For financial figures, preserve the exact number, units, fiscal period, and label shown in the source; "
+        "do not infer a number from a heading or combine values from different periods. "
+        "Use plain ASCII punctuation and spaces. "
+        "If the excerpts do not show the requested fact, say that the available excerpts are insufficient."
     )
     user_content = f"Context:\n{context_text}\n\nQuery: {query}\n\n"
     if feedback:
         user_content += f"IMPORTANT: Correct these audited errors:\n{feedback}\n\n"
     user_content += "Answer:"
-    return await client.complete(user_content, system_prompt=system_prompt)
+    answer = await client.complete(user_content, system_prompt=system_prompt, max_tokens=1000)
+    if answer is None:
+        return None
+
+    answer = ftfy.fix_text(answer)
+    answer = answer.replace("âs", "'s").replace("â¯", " ")
+    answer = answer.replace("\ufffd", "")
+    answer = re.sub(r"ã(?=\s|[.,;:!?]|$)", "", answer)
+    answer = re.sub(r"\bL\d+(?:\s*-\s*L\d+)?\b", "", answer)
+    answer = re.sub(r"[ \t]+", " ", answer)
+    answer = re.sub(r"\s+([.,;:!?])", r"\1", answer)
+    return answer.strip()
 
 async def synthesize_answer(client: Optional[LLMClient], query: str, results: List[Dict]) -> Optional[str]:
     return await synthesize_answer_with_feedback(client, query, results)
@@ -330,97 +476,142 @@ async def search(
 ) -> List[Dict]:
 
     detected_companies = detect_companies(query)
-    detected_year = detect_year(query)
-    detected_form = detect_form(query)
-
     company = companies or (detected_companies[0] if detected_companies else None)
-    year = year or detected_year
-    form = form or detected_form
+    year = year or detect_year(query)
+    form = form or detect_form(query)
     keywords = extract_keywords(query)
+    candidate_limit = max(1, candidate_k)
 
     query_embedding = get_embedding_cached(query, model)
-
-    # SAFETY GUARD: Check dimension before calling ChromaDB
     if len(query_embedding) != 384:
-        # If the DB expects 384 but we got something else, we must force a crash with a clear message
-        # because ChromaDB will just throw a generic InvalidArgumentError.
-        raise ValueError(f"CRITICAL DIMENSION MISMATCH: Database expects 384, but model {config.EMBEDDING_MODEL} produced {len(query_embedding)}. Please ensure config.EMBEDDING_MODEL is 'BAAI/bge-small-en-v1.5'")
+        raise ValueError(
+            f"CRITICAL DIMENSION MISMATCH: Database expects 384, but model "
+            f"{config.EMBEDDING_MODEL} produced {len(query_embedding)}. "
+            "Please ensure config.EMBEDDING_MODEL is 'BAAI/bge-small-en-v1.5'."
+        )
 
-    where = build_where_filter(company, year, form)
+    ids, corpus_documents, corpus_metadatas, tokenized_documents, bm25 = get_lexical_index(collection)
+    metadata_by_id = dict(zip(ids, corpus_metadatas))
+    document_by_id = dict(zip(ids, corpus_documents))
+
+    eligible_ids = [
+        chunk_id
+        for chunk_id in ids
+        if (company is None or metadata_by_id[chunk_id].get("company") == company)
+        and (form is None or metadata_by_id[chunk_id].get("form") == form)
+    ]
+    if year is not None and form == "10-K":
+        matching_period_ids = [
+            chunk_id
+            for chunk_id in eligible_ids
+            if get_period_year(metadata_by_id[chunk_id]) == year
+        ]
+        if matching_period_ids:
+            eligible_ids = matching_period_ids
+
+    if not eligible_ids:
+        return []
+
+    where = build_where_filter(company, None, form)
 
     def _do_query():
         return collection.query(
             query_embeddings=[query_embedding],
-            n_results=candidate_k,
+            n_results=min(candidate_limit, collection.count()),
             where=where,
-            include=["documents", "metadatas", "distances"]
+            include=["documents", "metadatas", "distances"],
         )
 
-    results = await asyncio.to_thread(_do_query)
-    documents_result = results["documents"]
-    metadatas_result = results["metadatas"]
-    distances_result = results["distances"]
-    if (
-        not documents_result
-        or not documents_result[0]
-        or not metadatas_result
-        or not metadatas_result[0]
-        or not distances_result
-        or not distances_result[0]
-    ):
+    vector_results = await asyncio.to_thread(_do_query)
+    vector_ids_result = vector_results.get("ids")
+    vector_ids = vector_ids_result[0] if vector_ids_result and vector_ids_result[0] else []
+    vector_distances_result = vector_results.get("distances")
+    vector_distances = (
+        vector_distances_result[0]
+        if vector_distances_result and vector_distances_result[0]
+        else []
+    )
+    eligible_id_set = set(eligible_ids)
+
+    semantic_ranked_ids = [
+        chunk_id for chunk_id in vector_ids if chunk_id in eligible_id_set
+    ]
+    semantic_distances = {
+        chunk_id: float(distance)
+        for chunk_id, distance in zip(vector_ids, vector_distances)
+        if chunk_id in eligible_id_set
+    }
+
+    expanded_query = expand_financial_query(query)
+    query_tokens = set(tokenize(expanded_query))
+    query_tokens.difference_update(
+        {"what", "was", "the", "did", "for", "in", "of", "how", "does", "report", "reported", "were", "is", "a", "an", "to", "from", "and", "fiscal", "year"}
+    )
+    if year is not None:
+        query_tokens.discard(str(year))
+    if company:
+        query_tokens.difference_update(tokenize(company))
+    bm25_scores = bm25.get_scores(tokenize(expanded_query))
+    lexical_ranked_ids = [
+        ids[index]
+        for index in sorted(
+            (index for index in range(len(ids)) if ids[index] in eligible_id_set),
+            key=lambda index: bm25_scores[index],
+            reverse=True,
+        )
+        if bm25_scores[index] > 0
+        or query_tokens.intersection(tokenized_documents[index])
+    ][:candidate_limit]
+
+    candidate_ids = list(dict.fromkeys(semantic_ranked_ids + lexical_ranked_ids))
+    if not candidate_ids:
         return []
 
-    documents = documents_result[0]
-    metadatas = metadatas_result[0]
-    distances = distances_result[0]
+    fused_scores: dict[str, float] = {}
+    for ranked_ids in (semantic_ranked_ids, lexical_ranked_ids):
+        for rank, chunk_id in enumerate(ranked_ids):
+            fused_scores[chunk_id] = fused_scores.get(chunk_id, 0.0) + 1.0 / (60 + rank + 1)
 
-    vector_ranks = list(range(len(documents)))
-    tokenized_corpus = [tokenize(doc) for doc in documents]
-    bm25 = BM25Okapi(tokenized_corpus)
-    bm25_scores = bm25.get_scores(tokenize(query))
-    bm25_ranks = sorted(range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True)
-    rrf_scores = reciprocal_rank_fusion(vector_ranks, bm25_ranks)
+    rerank_scores: dict[str, float] = {}
+    if reranker:
+        pairs = [[query, document_by_id[chunk_id]] for chunk_id in candidate_ids]
+        predicted_scores = reranker.predict(pairs)
+        rerank_scores = {
+            chunk_id: float(score)
+            for chunk_id, score in zip(candidate_ids, predicted_scores)
+        }
+        reranker_ranked_ids = sorted(
+            rerank_scores,
+            key=rerank_scores.__getitem__,
+            reverse=True,
+        )
+        for rank, chunk_id in enumerate(reranker_ranked_ids):
+            fused_scores[chunk_id] += 1.0 / (60 + rank + 1)
 
     candidates = []
-    for i in range(len(documents)):
-        doc, meta, dist = documents[i], metadatas[i], distances[i]
-        score = rrf_scores[i]
-        doc_lower = doc.lower()
+    for chunk_id in candidate_ids:
+        document = document_by_id[chunk_id]
+        metadata = dict(metadata_by_id[chunk_id])
+        metadata.setdefault("chunk_id", chunk_id)
+        matched = sum(1 for keyword in keywords if keyword.lower() in document.lower())
+        score = fused_scores[chunk_id] + financial_evidence_bonus(
+            query,
+            document,
+            metadata,
+            year,
+        )
+        candidates.append(
+            {
+                "document": document,
+                "metadata": metadata,
+                "distance": semantic_distances.get(chunk_id),
+                "score": float(score),
+                "rerank_score": rerank_scores.get(chunk_id, float(score)),
+                "matched_keywords": matched,
+            }
+        )
 
-        matched = sum(1 for kw in keywords if kw.lower() in doc_lower)
-        if keywords:
-            score += (matched / len(keywords)) * 0.2
-
-        if re.search(r"(total net sales|total revenue|net sales)\s*[:\$-]?\s*[\d,.]+", doc_lower):
-            score += 1.5
-
-        if any(h in doc_lower for h in ["consolidated statements of operations", "consolidated balance sheets"]):
-            score += 0.1
-
-        if "$" in doc and any(c.isdigit() for c in doc):
-            score += 0.05
-
-        if keywords and any(kw in ["revenue", "net sales", "total net sales", "sales"] for kw in keywords):
-            if any(exp in doc_lower for exp in ["operating expenses", "provision for income taxes", "r&d"]):
-                score -= 0.5
-
-        candidates.append({
-            "document": doc,
-            "metadata": meta,
-            "distance": float(dist),
-            "score": float(score),
-            "matched_keywords": matched,
-        })
-
-    if reranker:
-        pairs = [[query, c["document"]] for c in candidates]
-        rerank_scores = reranker.predict(pairs)
-        for i, s in enumerate(rerank_scores):
-            candidates[i]["rerank_score"] = float(s)
-    else:
-        for c in candidates: c["rerank_score"] = c["score"]
-
-    candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
+    candidates.sort(key=lambda item: item["score"], reverse=True)
     return candidates[:top_k]
 
 async def run_agentic_search(
@@ -444,7 +635,8 @@ async def run_agentic_search(
     first_results = await search(collection, model, reranker, client, query, top_k, candidate_k, companies, year, form)
 
     # Fast Path: if very confident, skip agentic loop
-    if first_results and first_results[0]["distance"] < config.CONFIDENCE_THRESHOLD:
+    first_distance = first_results[0].get("distance") if first_results else None
+    if first_distance is not None and first_distance < config.CONFIDENCE_THRESHOLD:
         answer = await synthesize_answer(client, query, first_results)
         if answer is None:
             report = "Answer synthesis unavailable"
@@ -475,7 +667,7 @@ async def run_agentic_search(
         seen_ids = set()
         unique = []
         for c in all_candidates:
-            cid = c["metadata"].get("chunk_id")
+            cid = c["metadata"].get("chunk_id") or c["document"]
             if cid not in seen_ids:
                 unique.append(c)
                 seen_ids.add(cid)
@@ -483,8 +675,15 @@ async def run_agentic_search(
         if reranker and unique:
             pairs = [[current_query, c["document"]] for c in unique]
             scores = reranker.predict(pairs)
-            for i, s in enumerate(scores): unique[i]["rerank_score"] = s
-            unique.sort(key=lambda x: x["rerank_score"], reverse=True)
+            reranked = sorted(
+                range(len(unique)),
+                key=lambda i: float(scores[i]),
+                reverse=True,
+            )
+            for rank, i in enumerate(reranked):
+                unique[i]["rerank_score"] = float(scores[i])
+                unique[i]["score"] += 1.0 / (60 + rank + 1)
+            unique.sort(key=lambda item: item["score"], reverse=True)
 
         final_results = unique[:top_k]
         is_relevant, feedback = await verify_relevance(client, query, final_results)
@@ -527,8 +726,23 @@ def print_results(query: str, results: List[Dict], synthesized_answer: Optional[
     else:
         print("\n(AI Summary not available - No LLM Client)")
     print(f"\nQuery: {query}")
+
+    # Deduplicate sources for display
+    unique_sources = {}
     for i, res in enumerate(results, 1):
-        print(f"\n{'-'*80}\nResult #{i}\nCompany: {res['metadata'].get('company')}\nDate: {res['metadata'].get('filing_date')}\nText:\n{res['document']}")
+        meta = res['metadata']
+        source_key = (meta.get('company'), meta.get('form'), meta.get('filing_date'))
+        if source_key not in unique_sources:
+            unique_sources[source_key] = []
+        unique_sources[source_key].append(i)
+
+    for idx, (source_meta, chunk_indices) in enumerate(unique_sources.items(), 1):
+        company, form, date = source_meta
+        indices_str = ", ".join(map(str, chunk_indices))
+        print(f"\nSource #{idx} [{indices_str}]: {company} {form} filed {date}")
+        # Optionally show the first chunk's text as a snippet
+        first_res = results[chunk_indices[0]-1]
+        print(f"Text snippet: {first_res['document'][:200]}...")
 
 async def main():
     parser = argparse.ArgumentParser()
